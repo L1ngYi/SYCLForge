@@ -733,7 +733,11 @@ def profile_candidate_with_ncu(
             str(exe_path),
         ]
 
-    replay_modes = ("kernel", "application")
+    # SYCL CUDA backend can fail to create a CUDA context under NCU kernel replay
+    # on some systems, and that failed attempt can poison the immediately
+    # following profiling run on exclusive-process GPUs. Try application replay
+    # first because it is the mode that works reliably for this runtime.
+    replay_modes = ("application", "kernel")
     attempts: list[str] = []
     try:
         env = get_sycl_environment(backend=backend, cuda_arch=cuda_arch)
