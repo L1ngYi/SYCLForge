@@ -4,6 +4,36 @@ A training-free multi-agent workflow for CUDA kernel generation and optimization
 
 <img src="./pic/human_agents_v2.png">
 
+## SYCLForge Extension
+
+This fork also includes `syclforge/`, a CudaForge-style optimization loop for
+fixed-shape SYCL GEMM kernels under `cpu_sycl/`.
+
+Quick seed-only check:
+```bash
+python -m syclforge.main_sycl cpu_sycl \
+  --case-stem gemm_1024_1024_1024 \
+  --round 1 \
+  --no-llm \
+  --no-ncu
+```
+
+Iterative SYCL optimization on NVIDIA A100:
+```bash
+export ONEAPI_DEVICE_SELECTOR=cuda:gpu
+export SYCL_TARGETS=nvptx64-nvidia-cuda
+export SYCL_CUDA_ARCH=sm_80
+
+python -m syclforge.main_sycl cpu_sycl \
+  --case-stem gemm_1024_1024_1024 \
+  --gpu A100 \
+  --server_type openai \
+  --model_name o3 \
+  --round 6
+```
+
+See `syclforge/README.md` for details.
+
 ## 🔧 Build Environment
 ```
 conda env create -f environment.yml
