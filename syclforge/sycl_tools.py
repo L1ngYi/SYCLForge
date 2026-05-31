@@ -717,45 +717,73 @@ def profile_candidate_with_ncu(
     if not compile_result.success:
         return ProfileResult(success=False, error=compile_result.output[-8000:], command=compile_result.command)
 
-    cmd = [
-        ncu_bin,
-        "--csv",
-        "--page=raw",
-        "--kernel-name-base=demangled",
-        "--target-processes=all",
-        "--replay-mode=kernel",
-        "--profile-from-start=on",
-        f"--log-file={csv_path}",
-        f"--metrics={','.join(NCU_METRICS)}",
-        "--launch-skip=0",
-        "--launch-count=30",
-        str(exe_path),
-    ]
+    def make_cmd(replay_mode: str, csv_file: Path) -> list[str]:
+        return [
+            ncu_bin,
+            "--csv",
+            "--page=raw",
+            "--kernel-name-base=demangled",
+            "--target-processes=all",
+            f"--replay-mode={replay_mode}",
+            "--profile-from-start=on",
+            f"--log-file={csv_file}",
+            f"--metrics={','.join(NCU_METRICS)}",
+            "--launch-skip=0",
+            "--launch-count=30",
+            str(exe_path),
+        ]
+
+    replay_modes = ("kernel", "application")
+    attempts: list[str] = []
     try:
         env = get_sycl_environment(backend=backend, cuda_arch=cuda_arch)
-        proc = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            encoding="utf-8",
-            text=True,
-            timeout=timeout,
-            env=env,
-        )
-        output = proc.stdout
-        if proc.returncode != 0:
-            return ProfileResult(success=False, error=output[-8000:], command=cmd, output=output, csv_path=str(csv_path))
-        rows = load_ncu_metrics(csv_path, kernel_tag=kernel_tag)
+        last_cmd: list[str] = []
+        last_csv_path = csv_path
+        for replay_mode in replay_modes:
+            mode_csv_path = profile_dir / f"round_{round_idx:03d}_ncu_{replay_mode}.csv"
+            cmd = make_cmd(replay_mode, mode_csv_path)
+            last_cmd = cmd
+            last_csv_path = mode_csv_path
+            proc = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                encoding="utf-8",
+                text=True,
+                timeout=timeout,
+                env=env,
+            )
+            output = proc.stdout
+            attempts.append(f"===== ncu replay-mode={replay_mode} returncode={proc.returncode} =====\n{output}")
+            if proc.returncode != 0:
+                continue
+            rows = load_ncu_metrics(mode_csv_path, kernel_tag=kernel_tag)
+            if rows:
+                if mode_csv_path != csv_path:
+                    try:
+                        shutil.copy2(mode_csv_path, csv_path)
+                    except Exception:
+                        pass
+                return ProfileResult(
+                    success=True,
+                    rows=rows,
+                    metrics_block=metrics_to_prompt(rows),
+                    csv_path=str(mode_csv_path),
+                    command=cmd,
+                    output="\n".join(attempts),
+                    error="",
+                )
+            attempts.append(f"ncu replay-mode={replay_mode} completed but no matching kernel rows were extracted.")
+
+        combined_output = "\n".join(attempts)
         return ProfileResult(
-            success=bool(rows),
-            rows=rows,
-            metrics_block=metrics_to_prompt(rows),
-            csv_path=str(csv_path),
-            command=cmd,
-            output=output,
-            error="" if rows else "ncu completed but no matching kernel rows were extracted",
+            success=False,
+            error=combined_output[-12000:],
+            command=last_cmd,
+            output=combined_output,
+            csv_path=str(last_csv_path),
         )
     except subprocess.TimeoutExpired:
-        return ProfileResult(success=False, error="ncu profiling timed out", command=cmd, csv_path=str(csv_path))
+        return ProfileResult(success=False, error="ncu profiling timed out", command=last_cmd if "last_cmd" in locals() else [], csv_path=str(last_csv_path if "last_csv_path" in locals() else csv_path))
     except Exception as exc:
-        return ProfileResult(success=False, error=str(exc), command=cmd, csv_path=str(csv_path))
+        return ProfileResult(success=False, error=str(exc), command=last_cmd if "last_cmd" in locals() else [], csv_path=str(last_csv_path if "last_csv_path" in locals() else csv_path))
