@@ -232,6 +232,10 @@ def _resolve_sycl_env_script() -> str | None:
             Path.home() / "env_sycl.sh",
         ]
     )
+
+    for base in (Path.cwd(), repo_root):
+        candidates.extend(parent / "env_sycl.sh" for parent in base.resolve().parents)
+
     for candidate in candidates:
         path = Path(candidate).expanduser().resolve()
         if path.is_file():

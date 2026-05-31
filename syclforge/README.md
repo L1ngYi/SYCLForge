@@ -26,6 +26,8 @@ export SYCL_CUDA_ARCH=sm_80
 
 `ncu` is optional but recommended. Use `--no-ncu` for latency-only feedback.
 
+中文快速上手见 [`使用说明.md`](使用说明.md)。
+
 ## Examples
 
 Evaluate one seed kernel without LLM calls:
