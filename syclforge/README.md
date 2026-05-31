@@ -25,6 +25,9 @@ export SYCL_CUDA_ARCH=sm_80
 ```
 
 `ncu` is optional but recommended. Use `--no-ncu` for latency-only feedback.
+Keep the GPU compute mode at `Default` for normal profiling runs. If the system
+must run in `Exclusive_Process` and automatic NCU profiling cannot acquire the
+device, add `--isolated-benchmark`.
 
 中文快速上手见 [`使用说明.md`](使用说明.md)。
 

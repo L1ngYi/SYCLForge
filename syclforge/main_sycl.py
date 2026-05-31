@@ -14,7 +14,7 @@ if __package__ in {None, ""}:
 
 from syclforge.code_io import normalize_sycl_source, save_text
 from syclforge.prompts import build_judge_prompt, build_optimization_prompt, build_repair_prompt
-from syclforge.sycl_tools import benchmark_candidate_isolated, profile_candidate_with_ncu
+from syclforge.sycl_tools import benchmark_candidate, benchmark_candidate_isolated, profile_candidate_with_ncu
 from syclforge.tasks import GemmTask, discover_tasks
 
 
@@ -40,6 +40,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rtol", type=float, default=1e-3)
     parser.add_argument("--atol", type=float, default=1e-3)
     parser.add_argument("--no-ncu", action="store_true", help="Disable Nsight Compute feedback and use latency-only feedback.")
+    parser.add_argument(
+        "--isolated-benchmark",
+        action="store_true",
+        help="Run benchmarking in a subprocess. Useful for GPUs in Exclusive_Process compute mode.",
+    )
     parser.add_argument("--no-llm", action="store_true", help="Only evaluate the existing seed kernels.")
     parser.add_argument("--server_type", default="local", help="CudaForge query_server provider.")
     parser.add_argument("--server_address", default="localhost")
@@ -173,11 +178,12 @@ def run_task(task: GemmTask, args: argparse.Namespace, batch_dir: Path) -> dict[
     best_round = -1
     seed_gflops: float | None = None
     rounds: list[dict[str, Any]] = []
+    benchmark_fn = benchmark_candidate_isolated if args.isolated_benchmark else benchmark_candidate
 
     for round_idx in range(max(1, args.round)):
         phase = "seed" if round_idx == 0 else "candidate"
         print(f"[{task.stem}] round {round_idx} {phase}", flush=True)
-        bench = benchmark_candidate_isolated(
+        bench = benchmark_fn(
             current_code,
             task=task,
             round_idx=round_idx,
