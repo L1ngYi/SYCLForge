@@ -613,6 +613,133 @@ def benchmark_candidate(
             return result
 
 
+def _benchmark_worker_entry(
+    source: str,
+    task: GemmTask,
+    round_idx: int,
+    work_dir: str,
+    warmup: int,
+    iters: int,
+    repeats: int,
+    rtol: float,
+    atol: float,
+    peak_gflops: float,
+    backend: str,
+    cuda_arch: str,
+    dump_harness: bool,
+    conn: Any,
+) -> None:
+    try:
+        result = benchmark_candidate(
+            source,
+            task=task,
+            round_idx=round_idx,
+            work_dir=Path(work_dir),
+            warmup=warmup,
+            iters=iters,
+            repeats=repeats,
+            rtol=rtol,
+            atol=atol,
+            peak_gflops=peak_gflops,
+            backend=backend,
+            cuda_arch=cuda_arch,
+            dump_harness=dump_harness,
+        )
+        conn.send(("ok", result.to_dict()))
+    except Exception as exc:
+        conn.send(
+            (
+                "err",
+                {
+                    "compile_success": False,
+                    "runnable": False,
+                    "correctness_pass": False,
+                    "score": None,
+                    "error_type": exc.__class__.__name__,
+                    "message": str(exc),
+                },
+            )
+        )
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def benchmark_candidate_isolated(
+    source: str,
+    *,
+    task: GemmTask,
+    round_idx: int,
+    work_dir: Path,
+    warmup: int,
+    iters: int,
+    repeats: int,
+    rtol: float,
+    atol: float,
+    peak_gflops: float,
+    backend: str = "nvidia",
+    cuda_arch: str = "sm_80",
+    dump_harness: bool = True,
+) -> BenchResult:
+    """Run the benchmark in a subprocess so the parent never owns a CUDA context.
+
+    This matters on A100 systems configured as Exclusive_Process: if the parent
+    process keeps a SYCL/CUDA context alive after ctypes benchmarking, the later
+    Nsight Compute subprocess cannot acquire the device.
+    """
+    from multiprocessing import get_context
+
+    ctx = get_context("spawn")
+    parent_conn, child_conn = ctx.Pipe(duplex=False)
+    process = ctx.Process(
+        target=_benchmark_worker_entry,
+        args=(
+            source,
+            task,
+            round_idx,
+            str(work_dir),
+            warmup,
+            iters,
+            repeats,
+            rtol,
+            atol,
+            peak_gflops,
+            backend,
+            cuda_arch,
+            dump_harness,
+            child_conn,
+        ),
+    )
+    process.start()
+    try:
+        child_conn.close()
+    except Exception:
+        pass
+    process.join()
+
+    payload = parent_conn.recv() if parent_conn.poll() else None
+    try:
+        parent_conn.close()
+    except Exception:
+        pass
+
+    if isinstance(payload, tuple) and len(payload) == 2:
+        data = payload[1]
+        if isinstance(data, dict):
+            allowed = set(BenchResult.__dataclass_fields__.keys())
+            return BenchResult(**{key: value for key, value in data.items() if key in allowed})
+
+    return BenchResult(
+        compile_success=False,
+        runnable=False,
+        correctness_pass=False,
+        error_type="BenchmarkSubprocessCrashed",
+        message="benchmark subprocess exited without a result",
+    )
+
+
 def _numeric(value: str) -> float | None:
     if value is None:
         return None
