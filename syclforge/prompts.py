@@ -110,6 +110,30 @@ For A100 FP32 GEMM, prefer a TF32 Tensor Core plan when correctness can still pa
 Use Nsight metric sm__inst_executed_pipe_tensor.avg.pct_of_peak_sustained_active as the main signal that Tensor Cores are actually used."""
 
 
+def _tensor_core_route_block(route: dict[str, Any] | None, lane: str = "") -> str:
+    if not route:
+        return "Tensor-core route: not requested."
+    route_compact = {
+        "mode": route.get("mode"),
+        "decision": route.get("decision"),
+        "enabled": route.get("enabled"),
+        "lane": lane or route.get("lane") or "",
+        "reason": route.get("reason"),
+    }
+    return json.dumps(route_compact, ensure_ascii=False, indent=2)
+
+
+def _skeleton_block(skeleton_code: str | None) -> str:
+    if not skeleton_code:
+        return ""
+    return f"""# Tensor Core skeleton
+The following skeleton is a known-good Tensor Core/joint_matrix starting point. Keep its legal joint_matrix types, address_space_cast pattern, and one-subgroup-per-16x16-tile launch structure unless the strategy explicitly justifies a safer change. Adapt shape constants to the current GEMM.
+```cpp
+{skeleton_code}
+```
+"""
+
+
 def build_repair_prompt(
     *,
     task: GemmTask,
@@ -118,6 +142,8 @@ def build_repair_prompt(
     bench_result: dict[str, Any],
     tensor_core_enabled: bool = False,
     tensor_core_report: dict[str, Any] | None = None,
+    tensor_core_route: dict[str, Any] | None = None,
+    lane: str = "",
     rtol: float = 1e-3,
     atol: float = 1e-3,
 ) -> tuple[str, str]:
@@ -138,6 +164,9 @@ Do not include main(), tests, host allocation, oneMKL, CUDA code, or non-SYCL li
 
 # Tensor Core policy
 {_tensor_core_block(tensor_core_enabled, tensor_core_report, rtol=rtol, atol=atol)}
+
+# Tensor Core route
+{_tensor_core_route_block(tensor_core_route, lane)}
 
 # Failure report
 {_result_block(bench_result)}
@@ -161,6 +190,8 @@ def build_judge_prompt(
     ncu_metrics_block: str,
     tensor_core_enabled: bool = False,
     tensor_core_report: dict[str, Any] | None = None,
+    tensor_core_route: dict[str, Any] | None = None,
+    lane: str = "",
     rtol: float = 1e-3,
     atol: float = 1e-3,
 ) -> tuple[str, str]:
@@ -174,6 +205,9 @@ Pick exactly one highest-impact optimization target. Return only JSON."""
 
 # Tensor Core policy
 {_tensor_core_block(tensor_core_enabled, tensor_core_report, rtol=rtol, atol=atol)}
+
+# Tensor Core route
+{_tensor_core_route_block(tensor_core_route, lane)}
 
 # Current benchmark result
 {_result_block(bench_result)}
@@ -210,6 +244,9 @@ def build_optimization_prompt(
     strategy: Any,
     tensor_core_enabled: bool = False,
     tensor_core_report: dict[str, Any] | None = None,
+    tensor_core_route: dict[str, Any] | None = None,
+    lane: str = "",
+    skeleton_code: str | None = None,
     rtol: float = 1e-3,
     atol: float = 1e-3,
 ) -> tuple[str, str]:
@@ -235,6 +272,11 @@ Return only improved C++ SYCL source in one fenced cpp block. No prose."""
 {_tensor_core_block(tensor_core_enabled, tensor_core_report, rtol=rtol, atol=atol)}
 
 If tensor-core mode is enabled, try a complete joint_matrix TF32 Tensor Core implementation before making another small SIMT-only tweak. The generated source should include any required SYCL matrix-extension header itself.
+
+# Tensor Core route
+{_tensor_core_route_block(tensor_core_route, lane)}
+
+{_skeleton_block(skeleton_code)}
 
 # Current benchmark result
 {_result_block(bench_result)}

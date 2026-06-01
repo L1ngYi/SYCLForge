@@ -48,12 +48,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--tensor-core",
         action="store_true",
-        help="Enable Tensor Core oriented prompts after a TF32 joint_matrix compile probe succeeds.",
+        help="Enable Tensor Core lanes. Use --tensor-core-mode to choose auto routing or force.",
+    )
+    parser.add_argument(
+        "--tensor-core-mode",
+        default="auto",
+        choices=["auto", "force", "off"],
+        help="Tensor Core routing mode when --tensor-core is set.",
     )
     parser.add_argument(
         "--require-tensor-core",
         action="store_true",
         help="Abort if --tensor-core is requested but the TF32 joint_matrix compile probe fails.",
+    )
+    parser.add_argument(
+        "--tensor-core-skeleton",
+        type=Path,
+        default=None,
+        help="Optional known-good joint_matrix source used for a Tensor Core skeleton mutation lane.",
     )
     parser.add_argument(
         "--isolated-benchmark",
@@ -130,11 +142,14 @@ def _save_round_artifacts(
     code: str,
     bench: dict[str, Any],
     profile: dict[str, Any] | None,
+    metadata: dict[str, Any] | None = None,
 ) -> Path:
     code_path = save_text(_round_code_path(task_dir, round_idx, phase), code)
     eval_dir = task_dir / "evaluation"
     eval_dir.mkdir(parents=True, exist_ok=True)
     payload = {"round": round_idx, "phase": phase, "code_path": str(code_path), "bench": bench, "profile": profile}
+    if metadata:
+        payload.update(metadata)
     save_text(eval_dir / f"round_{round_idx:03d}_{phase}.json", json.dumps(payload, indent=2, ensure_ascii=False))
     return code_path
 
@@ -181,31 +196,147 @@ def _profile_if_enabled(
     return profile.metrics_block if profile.success else json.dumps({"profile_error": profile.error}, indent=2), profile.to_dict()
 
 
-def run_task(task: GemmTask, args: argparse.Namespace, batch_dir: Path) -> dict[str, Any]:
-    if not hasattr(args, "tensor_core_enabled"):
-        args.tensor_core_enabled = False
-    if not hasattr(args, "tensor_core_report"):
-        args.tensor_core_report = {"requested": False, "enabled": False}
+def _classify_tensor_core_route(task: GemmTask, args: argparse.Namespace) -> dict[str, Any]:
+    requested = bool(args.tensor_core or args.require_tensor_core)
+    mode = "force" if args.require_tensor_core else args.tensor_core_mode
+    aligned = task.m % 16 == 0 and task.n % 16 == 0 and task.k % 8 == 0
+    reason_parts = []
+    if not requested or mode == "off":
+        return {
+            "requested": requested,
+            "mode": mode,
+            "decision": "off",
+            "enabled": False,
+            "reason": "Tensor Core routing disabled by CLI.",
+        }
 
+    if not aligned:
+        reason_parts.append("shape is not aligned to M%16==0, N%16==0, K%8==0")
+    if task.k < 32:
+        reason_parts.append("K is too small for useful TF32 joint_matrix reuse")
+    if task.m < 256 or task.n < 256:
+        reason_parts.append("M or N is too small to keep enough Tensor Core tiles in flight")
+
+    if mode == "force":
+        decision = "force"
+        enabled = True
+        reason = "forced by --tensor-core-mode force or --require-tensor-core"
+    elif not aligned or task.k < 32 or task.m < 256 or task.n < 256:
+        decision = "avoid"
+        enabled = False
+        reason = "; ".join(reason_parts)
+    elif task.m >= 1024 and task.n >= 1024 and task.k >= 128:
+        decision = "strong"
+        enabled = True
+        reason = "large aligned GEMM with high K; Tensor Core lane is strongly recommended"
+    elif task.m >= 512 and task.n >= 512 and task.k >= 32:
+        decision = "try"
+        enabled = True
+        reason = "aligned GEMM with enough tiles; Tensor Core lane is worth trying"
+    else:
+        decision = "avoid"
+        enabled = False
+        reason = "shape is aligned but likely too small to benefit from Tensor Core"
+
+    return {
+        "requested": requested,
+        "mode": mode,
+        "decision": decision,
+        "enabled": enabled,
+        "reason": reason,
+        "aligned_m16_n16_k8": aligned,
+        "shape": {"m": task.m, "k": task.k, "n": task.n},
+    }
+
+
+def _load_tensor_core_skeleton(args: argparse.Namespace) -> str:
+    path = args.tensor_core_skeleton
+    if path is None:
+        return ""
+    return path.expanduser().resolve().read_text(encoding="utf-8", errors="ignore")
+
+
+def _candidate_lanes(
+    *,
+    task_tensor_core_enabled: bool,
+    tensor_core_skeleton: str,
+) -> list[dict[str, Any]]:
+    lanes: list[dict[str, Any]] = [
+        {
+            "lane": "simt",
+            "phase": "candidate_simt",
+            "tensor_core_enabled": False,
+            "skeleton_code": "",
+        }
+    ]
+    if task_tensor_core_enabled:
+        lanes.append(
+            {
+                "lane": "tensor_free",
+                "phase": "candidate_tensor_free",
+                "tensor_core_enabled": True,
+                "skeleton_code": "",
+            }
+        )
+        if tensor_core_skeleton:
+            lanes.append(
+                {
+                    "lane": "tensor_skeleton",
+                    "phase": "candidate_tensor_skeleton",
+                    "tensor_core_enabled": True,
+                    "skeleton_code": tensor_core_skeleton,
+                }
+            )
+    return lanes
+
+
+def _make_candidate_item(code: str, *, phase: str, lane: str, tensor_core_enabled: bool) -> dict[str, Any]:
+    return {"code": code, "phase": phase, "lane": lane, "tensor_core_enabled": tensor_core_enabled}
+
+
+def run_task(task: GemmTask, args: argparse.Namespace, batch_dir: Path) -> dict[str, Any]:
     task_dir = batch_dir / task.stem
     task_dir.mkdir(parents=True, exist_ok=True)
     usage_log = task_dir / "usage.csv"
     call_llm = None if args.no_llm else _make_llm_caller(args, usage_log)
 
-    current_code = normalize_sycl_source(task.path.read_text(encoding="utf-8", errors="ignore"))
+    route = getattr(args, "tensor_core_routes", {}).get(task.stem, {"enabled": False, "decision": "off"})
+    task_tensor_core_enabled = bool(getattr(args, "tensor_core_enabled", False) and route.get("enabled"))
+    route = {**route, "effective_enabled": task_tensor_core_enabled}
+    tensor_core_report = getattr(args, "tensor_core_report", {"requested": False, "enabled": False})
+    tensor_core_skeleton = getattr(args, "tensor_core_skeleton_code", "")
+
+    seed_code = normalize_sycl_source(task.path.read_text(encoding="utf-8", errors="ignore"))
     best_code = ""
     best_score = float("-inf")
     best_round = -1
     seed_gflops: float | None = None
     rounds: list[dict[str, Any]] = []
-    use_isolated_benchmark = bool(args.isolated_benchmark or args.tensor_core_enabled)
-    if args.tensor_core_enabled and not args.isolated_benchmark:
+    pending: list[dict[str, Any]] = [
+        _make_candidate_item(seed_code, phase="seed", lane="seed", tensor_core_enabled=False)
+    ]
+    max_rounds = max(1, args.round)
+
+    route_path = save_text(task_dir / "tensor_core_route.json", json.dumps(route, indent=2, ensure_ascii=False))
+    print(
+        f"[{task.stem}] tensor-core route: {route.get('decision')} "
+        f"effective={route.get('effective_enabled')} ({route.get('reason')})",
+        flush=True,
+    )
+
+    use_isolated_benchmark = bool(args.isolated_benchmark or task_tensor_core_enabled)
+    if task_tensor_core_enabled and not args.isolated_benchmark:
         print(f"[{task.stem}] tensor-core mode: using isolated benchmark for native crash containment", flush=True)
     benchmark_fn = benchmark_candidate_isolated if use_isolated_benchmark else benchmark_candidate
 
-    for round_idx in range(max(1, args.round)):
-        phase = "seed" if round_idx == 0 else "candidate"
-        print(f"[{task.stem}] round {round_idx} {phase}", flush=True)
+    round_idx = 0
+    while round_idx < max_rounds and pending:
+        item = pending.pop(0)
+        current_code = item["code"]
+        phase = item["phase"]
+        lane = item.get("lane", phase)
+        item_tensor_core_enabled = bool(item.get("tensor_core_enabled", False) and task_tensor_core_enabled)
+        print(f"[{task.stem}] round {round_idx} {phase} lane={lane}", flush=True)
         bench = benchmark_fn(
             current_code,
             task=task,
@@ -246,72 +377,133 @@ def run_task(task: GemmTask, args: argparse.Namespace, batch_dir: Path) -> dict[
             code=current_code,
             bench=bench_dict,
             profile=profile_dict,
+            metadata={
+                "lane": lane,
+                "candidate_tensor_core_enabled": item_tensor_core_enabled,
+                "tensor_core_route": route,
+            },
         )
-        rounds.append({"round": round_idx, "phase": phase, "code_path": str(code_path), "bench": bench_dict, "profile": profile_dict})
+        rounds.append(
+            {
+                "round": round_idx,
+                "phase": phase,
+                "lane": lane,
+                "code_path": str(code_path),
+                "bench": bench_dict,
+                "profile": profile_dict,
+            }
+        )
 
-        if args.no_llm or round_idx == args.round - 1:
+        if args.no_llm or round_idx >= max_rounds - 1:
+            round_idx += 1
             break
         assert call_llm is not None
 
         io_dir = task_dir / "llm_io"
         io_dir.mkdir(parents=True, exist_ok=True)
+        remaining_slots = max_rounds - round_idx - 1
+
         if not bench.correctness_pass:
+            if pending:
+                round_idx += 1
+                continue
             system, prompt = build_repair_prompt(
                 task=task,
                 gpu_name=args.gpu,
                 current_code=current_code,
                 bench_result=bench_dict,
-                tensor_core_enabled=args.tensor_core_enabled,
-                tensor_core_report=args.tensor_core_report,
+                tensor_core_enabled=item_tensor_core_enabled,
+                tensor_core_report=tensor_core_report,
+                tensor_core_route=route,
+                lane=lane,
                 rtol=args.rtol,
                 atol=args.atol,
             )
             save_text(io_dir / f"round_{round_idx:03d}_repair_prompt.txt", prompt)
             raw = call_llm(prompt, system, call_type="repair", round_idx=round_idx)
             save_text(io_dir / f"round_{round_idx:03d}_repair_reply.txt", raw)
-            current_code = _normalize_generated_reply(
+            repair_code = _normalize_generated_reply(
                 raw,
                 previous_code=current_code,
                 error_path=io_dir / f"round_{round_idx:03d}_repair_parse_error.json",
             )
+            pending.append(
+                _make_candidate_item(
+                    repair_code,
+                    phase=f"repair_{lane}",
+                    lane=f"{lane}_repair",
+                    tensor_core_enabled=item_tensor_core_enabled,
+                )
+            )
+            round_idx += 1
             continue
 
-        judge_system, judge_prompt = build_judge_prompt(
-            task=task,
-            gpu_name=args.gpu,
-            current_code=current_code,
-            bench_result=bench_dict,
-            ncu_metrics_block=profile_block,
-            tensor_core_enabled=args.tensor_core_enabled,
-            tensor_core_report=args.tensor_core_report,
-            rtol=args.rtol,
-            atol=args.atol,
-        )
-        save_text(io_dir / f"round_{round_idx:03d}_judge_prompt.txt", judge_prompt)
-        judge_raw = call_llm(judge_prompt, judge_system, call_type="judge_optimization", round_idx=round_idx)
-        save_text(io_dir / f"round_{round_idx:03d}_judge_reply.txt", judge_raw)
-        strategy = _safe_json_from_reply(judge_raw)
+        if pending:
+            round_idx += 1
+            continue
 
-        opt_system, opt_prompt = build_optimization_prompt(
-            task=task,
-            gpu_name=args.gpu,
-            current_code=current_code,
-            bench_result=bench_dict,
-            ncu_metrics_block=profile_block,
-            strategy=strategy,
-            tensor_core_enabled=args.tensor_core_enabled,
-            tensor_core_report=args.tensor_core_report,
-            rtol=args.rtol,
-            atol=args.atol,
+        next_lanes = _candidate_lanes(
+            task_tensor_core_enabled=task_tensor_core_enabled,
+            tensor_core_skeleton=tensor_core_skeleton,
         )
-        save_text(io_dir / f"round_{round_idx:03d}_opt_prompt.txt", opt_prompt)
-        opt_raw = call_llm(opt_prompt, opt_system, call_type="optimization", round_idx=round_idx)
-        save_text(io_dir / f"round_{round_idx:03d}_opt_reply.txt", opt_raw)
-        current_code = _normalize_generated_reply(
-            opt_raw,
-            previous_code=current_code,
-            error_path=io_dir / f"round_{round_idx:03d}_opt_parse_error.json",
-        )
+        if str(lane).startswith("tensor"):
+            next_lanes = [item for item in next_lanes if item["tensor_core_enabled"]] + [
+                item for item in next_lanes if not item["tensor_core_enabled"]
+            ]
+
+        for lane_cfg in next_lanes[:remaining_slots]:
+            lane_name = lane_cfg["lane"]
+            lane_tensor_enabled = bool(lane_cfg["tensor_core_enabled"])
+            judge_system, judge_prompt = build_judge_prompt(
+                task=task,
+                gpu_name=args.gpu,
+                current_code=current_code,
+                bench_result=bench_dict,
+                ncu_metrics_block=profile_block,
+                tensor_core_enabled=lane_tensor_enabled,
+                tensor_core_report=tensor_core_report,
+                tensor_core_route={**route, "lane": lane_name},
+                lane=lane_name,
+                rtol=args.rtol,
+                atol=args.atol,
+            )
+            save_text(io_dir / f"round_{round_idx:03d}_{lane_name}_judge_prompt.txt", judge_prompt)
+            judge_raw = call_llm(judge_prompt, judge_system, call_type=f"judge_{lane_name}", round_idx=round_idx)
+            save_text(io_dir / f"round_{round_idx:03d}_{lane_name}_judge_reply.txt", judge_raw)
+            strategy = _safe_json_from_reply(judge_raw)
+
+            opt_system, opt_prompt = build_optimization_prompt(
+                task=task,
+                gpu_name=args.gpu,
+                current_code=current_code,
+                bench_result=bench_dict,
+                ncu_metrics_block=profile_block,
+                strategy=strategy,
+                tensor_core_enabled=lane_tensor_enabled,
+                tensor_core_report=tensor_core_report,
+                tensor_core_route={**route, "lane": lane_name},
+                lane=lane_name,
+                skeleton_code=lane_cfg.get("skeleton_code") or "",
+                rtol=args.rtol,
+                atol=args.atol,
+            )
+            save_text(io_dir / f"round_{round_idx:03d}_{lane_name}_opt_prompt.txt", opt_prompt)
+            opt_raw = call_llm(opt_prompt, opt_system, call_type=f"optimization_{lane_name}", round_idx=round_idx)
+            save_text(io_dir / f"round_{round_idx:03d}_{lane_name}_opt_reply.txt", opt_raw)
+            next_code = _normalize_generated_reply(
+                opt_raw,
+                previous_code=current_code,
+                error_path=io_dir / f"round_{round_idx:03d}_{lane_name}_opt_parse_error.json",
+            )
+            pending.append(
+                _make_candidate_item(
+                    next_code,
+                    phase=lane_cfg["phase"],
+                    lane=lane_name,
+                    tensor_core_enabled=lane_tensor_enabled,
+                )
+            )
+        round_idx += 1
 
     if best_code:
         best_path = save_text(task_dir / "best.cpp", best_code)
@@ -335,6 +527,8 @@ def run_task(task: GemmTask, args: argparse.Namespace, batch_dir: Path) -> dict[
         "speedup_vs_seed": speedup,
         "best_path": str(best_path) if best_code else "",
         "write_back_path": str(write_back_path) if write_back_path else "",
+        "tensor_core_route": route,
+        "tensor_core_route_path": str(route_path),
         "rounds": rounds,
     }
     save_text(task_dir / "summary.json", json.dumps(summary, indent=2, ensure_ascii=False))
@@ -347,7 +541,7 @@ def save_batch_summary(batch_dir: Path, summaries: list[dict[str, Any]]) -> None
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     with csv_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
-        writer.writerow(["stem", "best_round", "seed_gflops", "best_gflops", "speedup_vs_seed", "best_path"])
+        writer.writerow(["stem", "best_round", "seed_gflops", "best_gflops", "speedup_vs_seed", "tensor_core_decision", "best_path"])
         for item in summaries:
             writer.writerow(
                 [
@@ -356,17 +550,27 @@ def save_batch_summary(batch_dir: Path, summaries: list[dict[str, Any]]) -> None
                     item.get("seed_gflops") or "",
                     item.get("best_gflops") or "",
                     item.get("speedup_vs_seed") or "",
+                    (item.get("tensor_core_route") or {}).get("decision", ""),
                     item.get("best_path") or "",
                 ]
             )
 
 
-def configure_tensor_core_mode(args: argparse.Namespace, batch_dir: Path) -> None:
+def configure_tensor_core_mode(args: argparse.Namespace, batch_dir: Path, tasks: list[GemmTask]) -> None:
     args.tensor_core_enabled = False
     args.tensor_core_report = {"requested": bool(args.tensor_core or args.require_tensor_core), "enabled": False}
     if args.require_tensor_core:
         args.tensor_core = True
-    if not args.tensor_core:
+        args.tensor_core_mode = "force"
+    args.tensor_core_routes = {task.stem: _classify_tensor_core_route(task, args) for task in tasks}
+    args.tensor_core_skeleton_code = _load_tensor_core_skeleton(args)
+    save_text(batch_dir / "tensor_core_routes.json", json.dumps(args.tensor_core_routes, indent=2, ensure_ascii=False))
+
+    if not args.tensor_core or args.tensor_core_mode == "off":
+        return
+
+    if not any(route.get("enabled") for route in args.tensor_core_routes.values()):
+        print("[SYCLForge] tensor-core requested, but shape router selected SIMT-only lanes for all tasks.", flush=True)
         return
 
     probe = probe_tensor_core_support(batch_dir, backend=args.backend, cuda_arch=args.cuda_arch)
@@ -391,7 +595,7 @@ def main() -> None:
     batch_dir = _make_batch_dir(args)
     print(f"[SYCLForge] output: {batch_dir}", flush=True)
     print(f"[SYCLForge] tasks: {len(tasks)}", flush=True)
-    configure_tensor_core_mode(args, batch_dir)
+    configure_tensor_core_mode(args, batch_dir, tasks)
 
     summaries = []
     for index, task in enumerate(tasks, 1):

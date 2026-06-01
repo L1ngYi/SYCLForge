@@ -29,11 +29,13 @@ Keep the GPU compute mode at `Default` for normal profiling runs. If the system
 must run in `Exclusive_Process` and automatic NCU profiling cannot acquire the
 device, add `--isolated-benchmark`.
 
-Add `--tensor-core` to enable Tensor Core oriented prompts. SYCLForge first
-compiles and runs a TF32 `joint_matrix` canary; only a successful probe allows
-the LLM to use `sycl::ext::oneapi::experimental::matrix` APIs. Tensor Core mode
-automatically benchmarks candidates in a subprocess so native SYCL runtime
-assertions are recorded as failed candidates instead of aborting the driver.
+Add `--tensor-core` to enable Tensor Core routing. In the default
+`--tensor-core-mode auto`, SYCLForge enables Tensor Core lanes only for shapes
+that are aligned and large enough to benefit. A TF32 `joint_matrix` canary is
+compiled and run before the LLM may use
+`sycl::ext::oneapi::experimental::matrix` APIs. Tensor Core lanes are benchmarked
+in a subprocess so native SYCL runtime assertions are recorded as failed
+candidates instead of aborting the driver.
 
 中文快速上手见 [`使用说明.md`](使用说明.md)。
 
@@ -60,12 +62,14 @@ Run a Tensor Core oriented experiment:
 
 ```bash
 python -m syclforge.main_sycl cpu_sycl \
-  --case-stem gemm_128_128_128 \
+  --case-stem gemm_2048_2048_2048 \
   --server_type deepseek \
   --model_name deepseek-v4-pro \
-  --round 2 \
+  --round 4 \
   --max_tokens 16000 \
-  --tensor-core
+  --tensor-core \
+  --rtol 2e-2 \
+  --atol 5e-2
 ```
 
 Write best kernels to a separate directory:
