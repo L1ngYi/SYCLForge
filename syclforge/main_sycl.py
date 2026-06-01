@@ -310,6 +310,10 @@ def run_task(task: GemmTask, args: argparse.Namespace, batch_dir: Path) -> dict[
     best_code = ""
     best_score = float("-inf")
     best_round = -1
+    best_simt_code = seed_code
+    best_simt_score = float("-inf")
+    best_tensor_code = ""
+    best_tensor_score = float("-inf")
     seed_gflops: float | None = None
     rounds: list[dict[str, Any]] = []
     pending: list[dict[str, Any]] = [
@@ -358,6 +362,12 @@ def run_task(task: GemmTask, args: argparse.Namespace, batch_dir: Path) -> dict[
             best_score = bench.score
             best_code = current_code
             best_round = round_idx
+        if bench.correctness_pass and item_tensor_core_enabled and bench.score > best_tensor_score:
+            best_tensor_score = bench.score
+            best_tensor_code = current_code
+        if bench.correctness_pass and not item_tensor_core_enabled and bench.score > best_simt_score:
+            best_simt_score = bench.score
+            best_simt_code = current_code
 
         profile_block = "{}"
         profile_dict = None
@@ -379,6 +389,7 @@ def run_task(task: GemmTask, args: argparse.Namespace, batch_dir: Path) -> dict[
             profile=profile_dict,
             metadata={
                 "lane": lane,
+                "base_lane": item.get("base_lane", ""),
                 "candidate_tensor_core_enabled": item_tensor_core_enabled,
                 "tensor_core_route": route,
             },
@@ -391,6 +402,7 @@ def run_task(task: GemmTask, args: argparse.Namespace, batch_dir: Path) -> dict[
                 "code_path": str(code_path),
                 "bench": bench_dict,
                 "profile": profile_dict,
+                "base_lane": item.get("base_lane", ""),
             }
         )
 
@@ -454,10 +466,18 @@ def run_task(task: GemmTask, args: argparse.Namespace, batch_dir: Path) -> dict[
         for lane_cfg in next_lanes[:remaining_slots]:
             lane_name = lane_cfg["lane"]
             lane_tensor_enabled = bool(lane_cfg["tensor_core_enabled"])
+            lane_base_code = current_code
+            base_lane = lane
+            if lane_name == "simt":
+                lane_base_code = best_simt_code or seed_code
+                base_lane = "best_simt"
+            elif lane_tensor_enabled:
+                lane_base_code = best_tensor_code or best_code or current_code
+                base_lane = "best_tensor" if best_tensor_code else "best_overall"
             judge_system, judge_prompt = build_judge_prompt(
                 task=task,
                 gpu_name=args.gpu,
-                current_code=current_code,
+                current_code=lane_base_code,
                 bench_result=bench_dict,
                 ncu_metrics_block=profile_block,
                 tensor_core_enabled=lane_tensor_enabled,
@@ -475,7 +495,7 @@ def run_task(task: GemmTask, args: argparse.Namespace, batch_dir: Path) -> dict[
             opt_system, opt_prompt = build_optimization_prompt(
                 task=task,
                 gpu_name=args.gpu,
-                current_code=current_code,
+                current_code=lane_base_code,
                 bench_result=bench_dict,
                 ncu_metrics_block=profile_block,
                 strategy=strategy,
@@ -492,16 +512,19 @@ def run_task(task: GemmTask, args: argparse.Namespace, batch_dir: Path) -> dict[
             save_text(io_dir / f"round_{round_idx:03d}_{lane_name}_opt_reply.txt", opt_raw)
             next_code = _normalize_generated_reply(
                 opt_raw,
-                previous_code=current_code,
+                previous_code=lane_base_code,
                 error_path=io_dir / f"round_{round_idx:03d}_{lane_name}_opt_parse_error.json",
             )
             pending.append(
-                _make_candidate_item(
-                    next_code,
-                    phase=lane_cfg["phase"],
-                    lane=lane_name,
-                    tensor_core_enabled=lane_tensor_enabled,
-                )
+                {
+                    **_make_candidate_item(
+                        next_code,
+                        phase=lane_cfg["phase"],
+                        lane=lane_name,
+                        tensor_core_enabled=lane_tensor_enabled,
+                    ),
+                    "base_lane": base_lane,
+                }
             )
         round_idx += 1
 
