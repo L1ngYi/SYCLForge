@@ -14,7 +14,12 @@ if __package__ in {None, ""}:
 
 from syclforge.code_io import normalize_sycl_source, save_text
 from syclforge.prompts import build_judge_prompt, build_optimization_prompt, build_repair_prompt
-from syclforge.sycl_tools import benchmark_candidate, benchmark_candidate_isolated, profile_candidate_with_ncu
+from syclforge.sycl_tools import (
+    benchmark_candidate,
+    benchmark_candidate_isolated,
+    probe_tensor_core_support,
+    profile_candidate_with_ncu,
+)
 from syclforge.tasks import GemmTask, discover_tasks
 
 
@@ -40,6 +45,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rtol", type=float, default=1e-3)
     parser.add_argument("--atol", type=float, default=1e-3)
     parser.add_argument("--no-ncu", action="store_true", help="Disable Nsight Compute feedback and use latency-only feedback.")
+    parser.add_argument(
+        "--tensor-core",
+        action="store_true",
+        help="Enable Tensor Core oriented prompts after a TF32 joint_matrix compile probe succeeds.",
+    )
+    parser.add_argument(
+        "--require-tensor-core",
+        action="store_true",
+        help="Abort if --tensor-core is requested but the TF32 joint_matrix compile probe fails.",
+    )
     parser.add_argument(
         "--isolated-benchmark",
         action="store_true",
@@ -167,6 +182,11 @@ def _profile_if_enabled(
 
 
 def run_task(task: GemmTask, args: argparse.Namespace, batch_dir: Path) -> dict[str, Any]:
+    if not hasattr(args, "tensor_core_enabled"):
+        args.tensor_core_enabled = False
+    if not hasattr(args, "tensor_core_report"):
+        args.tensor_core_report = {"requested": False, "enabled": False}
+
     task_dir = batch_dir / task.stem
     task_dir.mkdir(parents=True, exist_ok=True)
     usage_log = task_dir / "usage.csv"
@@ -238,6 +258,8 @@ def run_task(task: GemmTask, args: argparse.Namespace, batch_dir: Path) -> dict[
                 gpu_name=args.gpu,
                 current_code=current_code,
                 bench_result=bench_dict,
+                tensor_core_enabled=args.tensor_core_enabled,
+                tensor_core_report=args.tensor_core_report,
             )
             save_text(io_dir / f"round_{round_idx:03d}_repair_prompt.txt", prompt)
             raw = call_llm(prompt, system, call_type="repair", round_idx=round_idx)
@@ -255,6 +277,8 @@ def run_task(task: GemmTask, args: argparse.Namespace, batch_dir: Path) -> dict[
             current_code=current_code,
             bench_result=bench_dict,
             ncu_metrics_block=profile_block,
+            tensor_core_enabled=args.tensor_core_enabled,
+            tensor_core_report=args.tensor_core_report,
         )
         save_text(io_dir / f"round_{round_idx:03d}_judge_prompt.txt", judge_prompt)
         judge_raw = call_llm(judge_prompt, judge_system, call_type="judge_optimization", round_idx=round_idx)
@@ -268,6 +292,8 @@ def run_task(task: GemmTask, args: argparse.Namespace, batch_dir: Path) -> dict[
             bench_result=bench_dict,
             ncu_metrics_block=profile_block,
             strategy=strategy,
+            tensor_core_enabled=args.tensor_core_enabled,
+            tensor_core_report=args.tensor_core_report,
         )
         save_text(io_dir / f"round_{round_idx:03d}_opt_prompt.txt", opt_prompt)
         opt_raw = call_llm(opt_prompt, opt_system, call_type="optimization", round_idx=round_idx)
@@ -326,6 +352,29 @@ def save_batch_summary(batch_dir: Path, summaries: list[dict[str, Any]]) -> None
             )
 
 
+def configure_tensor_core_mode(args: argparse.Namespace, batch_dir: Path) -> None:
+    args.tensor_core_enabled = False
+    args.tensor_core_report = {"requested": bool(args.tensor_core or args.require_tensor_core), "enabled": False}
+    if args.require_tensor_core:
+        args.tensor_core = True
+    if not args.tensor_core:
+        return
+
+    probe = probe_tensor_core_support(batch_dir, backend=args.backend, cuda_arch=args.cuda_arch)
+    args.tensor_core_enabled = probe.enabled
+    args.tensor_core_report = probe.to_dict()
+    save_text(batch_dir / "tensor_core_probe.json", json.dumps(args.tensor_core_report, indent=2, ensure_ascii=False))
+
+    if probe.enabled:
+        print(f"[SYCLForge] tensor-core mode enabled via {probe.flavor}", flush=True)
+        return
+
+    print("[SYCLForge] tensor-core probe failed; falling back to SIMT prompts.", flush=True)
+    print(f"[SYCLForge] tensor-core probe log: {probe.source_path}", flush=True)
+    if args.require_tensor_core:
+        raise SystemExit("Tensor Core mode was required, but the TF32 joint_matrix compile probe failed.")
+
+
 def main() -> None:
     args = build_arg_parser().parse_args()
     started = time.time()
@@ -333,6 +382,7 @@ def main() -> None:
     batch_dir = _make_batch_dir(args)
     print(f"[SYCLForge] output: {batch_dir}", flush=True)
     print(f"[SYCLForge] tasks: {len(tasks)}", flush=True)
+    configure_tensor_core_mode(args, batch_dir)
 
     summaries = []
     for index, task in enumerate(tasks, 1):

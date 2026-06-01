@@ -29,6 +29,10 @@ Keep the GPU compute mode at `Default` for normal profiling runs. If the system
 must run in `Exclusive_Process` and automatic NCU profiling cannot acquire the
 device, add `--isolated-benchmark`.
 
+Add `--tensor-core` to enable Tensor Core oriented prompts. SYCLForge first
+compiles a TF32 `joint_matrix` canary; only a successful probe allows the LLM to
+use `sycl::ext::oneapi::experimental::matrix` APIs.
+
 中文快速上手见 [`使用说明.md`](使用说明.md)。
 
 ## Examples
@@ -48,6 +52,18 @@ python -m syclforge.main_sycl cpu_sycl \
   --server_type openai \
   --model_name o3 \
   --round 6
+```
+
+Run a Tensor Core oriented experiment:
+
+```bash
+python -m syclforge.main_sycl cpu_sycl \
+  --case-stem gemm_128_128_128 \
+  --server_type deepseek \
+  --model_name deepseek-v4-pro \
+  --round 2 \
+  --max_tokens 16000 \
+  --tensor-core
 ```
 
 Write best kernels to a separate directory:

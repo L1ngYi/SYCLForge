@@ -95,6 +95,21 @@ class ProfileResult:
         return asdict(self)
 
 
+@dataclass
+class TensorCoreProbeResult:
+    requested: bool
+    enabled: bool
+    flavor: str = ""
+    source_path: str = ""
+    binary_path: str = ""
+    compile_success: bool = False
+    compile_output: str = ""
+    command: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
 def _parse_param_decl(param_decl: str) -> dict[str, Any]:
     normalized = param_decl.replace("*", " * ").replace("&", " & ").strip()
     tokens = normalized.split()
@@ -363,6 +378,83 @@ def compile_sycl_source(
         return CompileResult(success=False, output="Compilation timed out", command=cmd if "cmd" in locals() else [])
     except Exception as exc:
         return CompileResult(success=False, output=str(exc), command=[])
+
+
+TENSOR_CORE_TF32_CANARY_SOURCE = r"""
+#include <sycl/sycl.hpp>
+#include <sycl/ext/oneapi/matrix/matrix.hpp>
+
+int main() {
+  namespace mx = sycl::ext::oneapi::experimental::matrix;
+  using tf32 = mx::precision::tf32;
+  constexpr int TM = 16;
+  constexpr int TN = 16;
+  constexpr int TK = 8;
+  constexpr int SG = 32;
+
+  float A[TM * TK] = {};
+  float B[TK * TN] = {};
+  float C[TM * TN] = {};
+  sycl::buffer<float, 2> bufA(A, sycl::range<2>(TM, TK));
+  sycl::buffer<float, 2> bufB(B, sycl::range<2>(TK, TN));
+  sycl::buffer<float, 2> bufC(C, sycl::range<2>(TM, TN));
+  sycl::queue q{sycl::gpu_selector_v};
+
+  q.submit([&](sycl::handler &h) {
+    sycl::accessor accA(bufA, h, sycl::read_only);
+    sycl::accessor accB(bufB, h, sycl::read_only);
+    sycl::accessor accC(bufC, h, sycl::write_only, sycl::no_init);
+    h.parallel_for(
+        sycl::nd_range<2>(sycl::range<2>(1, SG), sycl::range<2>(1, SG)),
+        [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(SG)]] {
+          sycl::sub_group sg = item.get_sub_group();
+          mx::joint_matrix<sycl::sub_group, tf32, mx::use::a, TM, TK, mx::layout::row_major> sub_a;
+          mx::joint_matrix<sycl::sub_group, tf32, mx::use::b, TK, TN, mx::layout::row_major> sub_b;
+          mx::joint_matrix<sycl::sub_group, float, mx::use::accumulator, TM, TN> sub_c;
+          mx::joint_matrix_fill(sg, sub_c, 0.0f);
+          mx::joint_matrix_load(sg, sub_a, accA.get_pointer(), TK);
+          mx::joint_matrix_load(sg, sub_b, accB.get_pointer(), TN);
+          sub_c = mx::joint_matrix_mad(sg, sub_a, sub_b, sub_c);
+          mx::joint_matrix_store(sg, sub_c, accC.get_pointer(), TN, mx::layout::row_major);
+        });
+  });
+  q.wait();
+  return 0;
+}
+"""
+
+
+def probe_tensor_core_support(
+    work_dir: Path,
+    *,
+    backend: str = "nvidia",
+    cuda_arch: str = "sm_80",
+) -> TensorCoreProbeResult:
+    """Compile a small TF32 joint_matrix kernel before enabling tensor-core prompts."""
+    probe_dir = work_dir / "tensor_core_probe"
+    probe_dir.mkdir(parents=True, exist_ok=True)
+    source_path = probe_dir / "joint_matrix_tf32_canary.cpp"
+    binary_path = probe_dir / "joint_matrix_tf32_canary"
+    source_path.write_text(TENSOR_CORE_TF32_CANARY_SOURCE, encoding="utf-8")
+
+    result = compile_sycl_source(
+        source_path,
+        binary_path,
+        shared=False,
+        backend=backend,
+        cuda_arch=cuda_arch,
+        timeout=180,
+    )
+    return TensorCoreProbeResult(
+        requested=True,
+        enabled=result.success,
+        flavor="tf32_joint_matrix" if result.success else "",
+        source_path=str(source_path),
+        binary_path=str(binary_path),
+        compile_success=result.success,
+        compile_output=result.output,
+        command=result.command,
+    )
 
 
 @lru_cache(maxsize=None)

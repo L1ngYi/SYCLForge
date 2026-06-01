@@ -54,12 +54,33 @@ def _result_block(result: dict[str, Any]) -> str:
     return json.dumps(compact, ensure_ascii=False, indent=2)
 
 
+def _tensor_core_block(enabled: bool, report: dict[str, Any] | None = None) -> str:
+    if not enabled:
+        return """Tensor-core mode: disabled.
+Use portable SIMT SYCL optimizations only. Do not use joint_matrix or other experimental matrix extensions."""
+
+    report = report or {}
+    flavor = report.get("flavor") or "tf32_joint_matrix"
+    return f"""Tensor-core mode: enabled.
+The compiler accepted a {flavor} canary using <sycl/ext/oneapi/matrix/matrix.hpp>.
+You may use sycl::ext::oneapi::experimental::matrix joint_matrix APIs:
+- joint_matrix, joint_matrix_load, joint_matrix_store, joint_matrix_fill, joint_matrix_mad
+- sycl::sub_group with [[sycl::reqd_sub_group_size(32)]]
+- TF32 input fragments via sycl::ext::oneapi::experimental::matrix::precision::tf32 with float accumulators
+
+Keep the public API as float* A, float* B, float* C. Do not use CUDA syntax or oneMKL.
+For A100 FP32 GEMM, prefer a TF32 Tensor Core plan when correctness can still pass rtol/atol around 1e-3.
+Use Nsight metric sm__inst_executed_pipe_tensor.avg.pct_of_peak_sustained_active as the main signal that Tensor Cores are actually used."""
+
+
 def build_repair_prompt(
     *,
     task: GemmTask,
     gpu_name: str,
     current_code: str,
     bench_result: dict[str, Any],
+    tensor_core_enabled: bool = False,
+    tensor_core_report: dict[str, Any] | None = None,
 ) -> tuple[str, str]:
     system = """You are a senior SYCL compiler engineer repairing one GEMM kernel.
 Return only corrected C++ SYCL source in one fenced cpp block. No prose."""
@@ -75,6 +96,9 @@ void gemm(float *A, float *B, float *C, int m, int k, int n, sycl::queue &q)
 
 The function must enqueue one SYCL kernel and leave synchronization to the caller.
 Do not include main(), tests, host allocation, oneMKL, CUDA code, or non-SYCL libraries.
+
+# Tensor Core policy
+{_tensor_core_block(tensor_core_enabled, tensor_core_report)}
 
 # Failure report
 {_result_block(bench_result)}
@@ -96,6 +120,8 @@ def build_judge_prompt(
     current_code: str,
     bench_result: dict[str, Any],
     ncu_metrics_block: str,
+    tensor_core_enabled: bool = False,
+    tensor_core_report: dict[str, Any] | None = None,
 ) -> tuple[str, str]:
     system = """You are a senior NVIDIA A100 performance engineer for SYCL kernels.
 Pick exactly one highest-impact optimization target. Return only JSON."""
@@ -104,6 +130,9 @@ Pick exactly one highest-impact optimization target. Return only JSON."""
 
 # GEMM task
 {_shape_block(task)}
+
+# Tensor Core policy
+{_tensor_core_block(tensor_core_enabled, tensor_core_report)}
 
 # Current benchmark result
 {_result_block(bench_result)}
@@ -115,6 +144,8 @@ Pick exactly one highest-impact optimization target. Return only JSON."""
 ```cpp
 {current_code}
 ```
+
+When tensor-core mode is enabled and tensor pipe utilization is near zero, strongly prefer a joint_matrix/TF32 Tensor Core optimization target unless the shape or correctness constraints make it unreasonable.
 
 Return exactly this JSON object:
 ```json
@@ -136,6 +167,8 @@ def build_optimization_prompt(
     bench_result: dict[str, Any],
     ncu_metrics_block: str,
     strategy: Any,
+    tensor_core_enabled: bool = False,
+    tensor_core_report: dict[str, Any] | None = None,
 ) -> tuple[str, str]:
     system = """You are a SYCL GEMM optimization specialist targeting NVIDIA A100 through the SYCL CUDA backend.
 Return only improved C++ SYCL source in one fenced cpp block. No prose."""
@@ -151,9 +184,14 @@ Return only improved C++ SYCL source in one fenced cpp block. No prose."""
 - Input matrices are row-major: A[M,K], B[K,N], C[M,N].
 - Preserve float32 output correctness with rtol/atol around 1e-3.
 - Enqueue one kernel from q using nd_range or parallel_for.
-- Standard SYCL only: no CUDA syntax, no oneMKL, no main(), no host malloc/free.
+- No CUDA syntax, no oneMKL, no main(), no host malloc/free.
 - Shape-specialized constants are allowed for this M/K/N case.
 - Prefer robust A100 optimizations: 2D tiling, local_accessor caching, coalesced global reads, register micro-tiles, K unrolling, local-memory padding, reqd_sub_group_size(32).
+
+# Tensor Core policy
+{_tensor_core_block(tensor_core_enabled, tensor_core_report)}
+
+If tensor-core mode is enabled, try a complete joint_matrix TF32 Tensor Core implementation before making another small SIMT-only tweak. The generated source should include any required SYCL matrix-extension header itself.
 
 # Current benchmark result
 {_result_block(bench_result)}
