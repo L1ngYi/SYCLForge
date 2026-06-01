@@ -105,6 +105,9 @@ class TensorCoreProbeResult:
     compile_success: bool = False
     compile_output: str = ""
     command: list[str] = field(default_factory=list)
+    run_success: bool = False
+    run_output: str = ""
+    run_returncode: int | None = None
     attempts: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -469,7 +472,38 @@ def probe_tensor_core_support(
             "command": result.command,
         }
         attempts.append(attempt)
+        run_success = False
+        run_output = ""
+        run_returncode: int | None = None
         if result.success:
+            try:
+                run_proc = subprocess.run(
+                    [str(binary_path)],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    encoding="utf-8",
+                    text=True,
+                    timeout=30,
+                    env=get_sycl_environment(backend=backend, cuda_arch=cuda_arch),
+                )
+                run_success = run_proc.returncode == 0
+                run_output = run_proc.stdout
+                run_returncode = run_proc.returncode
+            except subprocess.TimeoutExpired as exc:
+                run_output = (exc.output or "") + "\nTensor Core probe timed out."
+                run_returncode = None
+            except Exception as exc:
+                run_output = str(exc)
+                run_returncode = None
+            attempt.update(
+                {
+                    "run_success": run_success,
+                    "run_output": run_output,
+                    "run_returncode": run_returncode,
+                }
+            )
+
+        if result.success and run_success:
             return TensorCoreProbeResult(
                 requested=True,
                 enabled=True,
@@ -479,6 +513,9 @@ def probe_tensor_core_support(
                 compile_success=True,
                 compile_output=result.output,
                 command=result.command,
+                run_success=True,
+                run_output=run_output,
+                run_returncode=run_returncode,
                 attempts=attempts,
             )
 
@@ -489,11 +526,16 @@ def probe_tensor_core_support(
         flavor="",
         source_path=str(last.get("source_path") or ""),
         binary_path=str(last.get("binary_path") or ""),
-        compile_success=False,
+        compile_success=any(bool(attempt.get("compile_success")) for attempt in attempts),
         compile_output="\n\n".join(
             f"===== {attempt['flavor']} =====\n{attempt.get('compile_output') or ''}" for attempt in attempts
         ),
         command=list(last.get("command") or []),
+        run_success=False,
+        run_output="\n\n".join(
+            f"===== {attempt['flavor']} =====\n{attempt.get('run_output') or ''}" for attempt in attempts
+        ),
+        run_returncode=last.get("run_returncode"),
         attempts=attempts,
     )
 

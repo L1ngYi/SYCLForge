@@ -62,7 +62,7 @@ Use portable SIMT SYCL optimizations only. Do not use joint_matrix or other expe
     report = report or {}
     flavor = report.get("flavor") or "tf32_joint_matrix"
     return f"""Tensor-core mode: enabled.
-The compiler accepted a {flavor} canary using <sycl/ext/oneapi/matrix/matrix.hpp>.
+SYCLForge compiled and ran a {flavor} canary using <sycl/ext/oneapi/matrix/matrix.hpp>.
 You may use sycl::ext::oneapi::experimental::matrix joint_matrix APIs:
 - joint_matrix, joint_matrix_load, joint_matrix_store, joint_matrix_fill, joint_matrix_mad
 - Prefer the modern void API form: mx::joint_matrix_mad(sg, sub_c, sub_a, sub_b, sub_c);
@@ -75,6 +75,7 @@ For the NVIDIA CUDA backend on A100, follow these hard rules:
 - A and B fragments must specify a concrete layout, usually `mx::layout::row_major`; do not leave them as layout::dynamic.
 - Accumulator fragments use `float` and `mx::use::accumulator`.
 - Prefer supported TF32 shape `M=16, N=16, K=8` for one subgroup tile.
+- Launch one subgroup per 16x16 C tile. Use a work-group containing exactly one 32-lane subgroup, for example `sycl::nd_range<2>(sycl::range<2>(num_tiles, 32), sycl::range<2>(1, 32))`; do not use SIMT-style local ranges such as `(16,16)` for a joint_matrix kernel.
 - joint_matrix_load/store require a SYCL multi_ptr or accessor pointer, not a raw `float*`.
 - For USM pointers inside the kernel, first create:
   `auto pA = sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(A);`
