@@ -65,6 +65,7 @@ Use portable SIMT SYCL optimizations only. Do not use joint_matrix or other expe
 The compiler accepted a {flavor} canary using <sycl/ext/oneapi/matrix/matrix.hpp>.
 You may use sycl::ext::oneapi::experimental::matrix joint_matrix APIs:
 - joint_matrix, joint_matrix_load, joint_matrix_store, joint_matrix_fill, joint_matrix_mad
+- Prefer the modern void API form: mx::joint_matrix_mad(sg, sub_c, sub_a, sub_b, sub_c);
 - sycl::sub_group with [[sycl::reqd_sub_group_size(32)]]
 - TF32 input fragments via sycl::ext::oneapi::experimental::matrix::precision::tf32 with float accumulators
 

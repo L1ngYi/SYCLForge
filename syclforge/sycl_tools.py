@@ -105,6 +105,7 @@ class TensorCoreProbeResult:
     compile_success: bool = False
     compile_output: str = ""
     command: list[str] = field(default_factory=list)
+    attempts: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -414,7 +415,7 @@ int main() {
           mx::joint_matrix_fill(sg, sub_c, 0.0f);
           mx::joint_matrix_load(sg, sub_a, accA.get_pointer(), TK);
           mx::joint_matrix_load(sg, sub_b, accB.get_pointer(), TN);
-          sub_c = mx::joint_matrix_mad(sg, sub_a, sub_b, sub_c);
+          mx::joint_matrix_mad(sg, sub_c, sub_a, sub_b, sub_c);
           mx::joint_matrix_store(sg, sub_c, accC.get_pointer(), TN, mx::layout::row_major);
         });
   });
@@ -424,36 +425,76 @@ int main() {
 """
 
 
+TENSOR_CORE_TF32_RETURN_CANARY_SOURCE = TENSOR_CORE_TF32_CANARY_SOURCE.replace(
+    "mx::joint_matrix_mad(sg, sub_c, sub_a, sub_b, sub_c);",
+    "sub_c = mx::joint_matrix_mad(sg, sub_a, sub_b, sub_c);",
+)
+
+
+TENSOR_CORE_CANARIES = [
+    ("tf32_joint_matrix", TENSOR_CORE_TF32_CANARY_SOURCE),
+    ("tf32_joint_matrix_return_api", TENSOR_CORE_TF32_RETURN_CANARY_SOURCE),
+]
+
+
 def probe_tensor_core_support(
     work_dir: Path,
     *,
     backend: str = "nvidia",
     cuda_arch: str = "sm_80",
 ) -> TensorCoreProbeResult:
-    """Compile a small TF32 joint_matrix kernel before enabling tensor-core prompts."""
+    """Compile small TF32 joint_matrix kernels before enabling tensor-core prompts."""
     probe_dir = work_dir / "tensor_core_probe"
     probe_dir.mkdir(parents=True, exist_ok=True)
-    source_path = probe_dir / "joint_matrix_tf32_canary.cpp"
-    binary_path = probe_dir / "joint_matrix_tf32_canary"
-    source_path.write_text(TENSOR_CORE_TF32_CANARY_SOURCE, encoding="utf-8")
+    attempts: list[dict[str, Any]] = []
 
-    result = compile_sycl_source(
-        source_path,
-        binary_path,
-        shared=False,
-        backend=backend,
-        cuda_arch=cuda_arch,
-        timeout=180,
-    )
+    for flavor, source in TENSOR_CORE_CANARIES:
+        source_path = probe_dir / f"{flavor}_canary.cpp"
+        binary_path = probe_dir / f"{flavor}_canary"
+        source_path.write_text(source, encoding="utf-8")
+        result = compile_sycl_source(
+            source_path,
+            binary_path,
+            shared=False,
+            backend=backend,
+            cuda_arch=cuda_arch,
+            timeout=180,
+        )
+        attempt = {
+            "flavor": flavor,
+            "source_path": str(source_path),
+            "binary_path": str(binary_path),
+            "compile_success": result.success,
+            "compile_output": result.output,
+            "command": result.command,
+        }
+        attempts.append(attempt)
+        if result.success:
+            return TensorCoreProbeResult(
+                requested=True,
+                enabled=True,
+                flavor=flavor,
+                source_path=str(source_path),
+                binary_path=str(binary_path),
+                compile_success=True,
+                compile_output=result.output,
+                command=result.command,
+                attempts=attempts,
+            )
+
+    last = attempts[-1] if attempts else {}
     return TensorCoreProbeResult(
         requested=True,
-        enabled=result.success,
-        flavor="tf32_joint_matrix" if result.success else "",
-        source_path=str(source_path),
-        binary_path=str(binary_path),
-        compile_success=result.success,
-        compile_output=result.output,
-        command=result.command,
+        enabled=False,
+        flavor="",
+        source_path=str(last.get("source_path") or ""),
+        binary_path=str(last.get("binary_path") or ""),
+        compile_success=False,
+        compile_output="\n\n".join(
+            f"===== {attempt['flavor']} =====\n{attempt.get('compile_output') or ''}" for attempt in attempts
+        ),
+        command=list(last.get("command") or []),
+        attempts=attempts,
     )
 
 
