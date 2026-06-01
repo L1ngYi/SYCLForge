@@ -869,7 +869,7 @@ def benchmark_candidate_isolated(
         runnable=False,
         correctness_pass=False,
         error_type="BenchmarkSubprocessCrashed",
-        message="benchmark subprocess exited without a result",
+        message=f"benchmark subprocess exited without a result; exitcode={process.exitcode}",
     )
 
 

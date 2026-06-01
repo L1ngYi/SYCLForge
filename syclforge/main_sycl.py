@@ -198,7 +198,10 @@ def run_task(task: GemmTask, args: argparse.Namespace, batch_dir: Path) -> dict[
     best_round = -1
     seed_gflops: float | None = None
     rounds: list[dict[str, Any]] = []
-    benchmark_fn = benchmark_candidate_isolated if args.isolated_benchmark else benchmark_candidate
+    use_isolated_benchmark = bool(args.isolated_benchmark or args.tensor_core_enabled)
+    if args.tensor_core_enabled and not args.isolated_benchmark:
+        print(f"[{task.stem}] tensor-core mode: using isolated benchmark for native crash containment", flush=True)
+    benchmark_fn = benchmark_candidate_isolated if use_isolated_benchmark else benchmark_candidate
 
     for round_idx in range(max(1, args.round)):
         phase = "seed" if round_idx == 0 else "candidate"
