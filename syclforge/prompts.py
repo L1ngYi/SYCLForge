@@ -69,6 +69,35 @@ You may use sycl::ext::oneapi::experimental::matrix joint_matrix APIs:
 - sycl::sub_group with [[sycl::reqd_sub_group_size(32)]]
 - TF32 input fragments via sycl::ext::oneapi::experimental::matrix::precision::tf32 with float accumulators
 
+For the NVIDIA CUDA backend on A100, follow these hard rules:
+- Use namespace alias `namespace mx = sycl::ext::oneapi::experimental::matrix;`.
+- A and B fragments must use `mx::precision::tf32`, not `float`.
+- A and B fragments must specify a concrete layout, usually `mx::layout::row_major`; do not leave them as layout::dynamic.
+- Accumulator fragments use `float` and `mx::use::accumulator`.
+- Prefer supported TF32 shape `M=16, N=16, K=8` for one subgroup tile.
+- joint_matrix_load/store require a SYCL multi_ptr or accessor pointer, not a raw `float*`.
+- For USM pointers inside the kernel, first create:
+  `auto pA = sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(A);`
+  and similarly for B and C, then pass `pA + offset`, `pB + offset`, `pC + offset` to joint_matrix_load/store.
+- Never write `joint_matrix<sub_group, float, mx::use::a, ...>` or `joint_matrix<sub_group, float, mx::use::b, ...>` on CUDA; that instantiates an unsupported `joint_matrix_cuda<float,...>`.
+
+Minimal legal TF32 pattern:
+```cpp
+namespace mx = sycl::ext::oneapi::experimental::matrix;
+using tf32 = mx::precision::tf32;
+auto pA = sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(A);
+auto pB = sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(B);
+auto pC = sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(C);
+mx::joint_matrix<sycl::sub_group, tf32, mx::use::a, 16, 8, mx::layout::row_major> sub_a;
+mx::joint_matrix<sycl::sub_group, tf32, mx::use::b, 8, 16, mx::layout::row_major> sub_b;
+mx::joint_matrix<sycl::sub_group, float, mx::use::accumulator, 16, 16> sub_c;
+mx::joint_matrix_fill(sg, sub_c, 0.0f);
+mx::joint_matrix_load(sg, sub_a, pA + a_offset, k);
+mx::joint_matrix_load(sg, sub_b, pB + b_offset, n);
+mx::joint_matrix_mad(sg, sub_c, sub_a, sub_b, sub_c);
+mx::joint_matrix_store(sg, sub_c, pC + c_offset, n, mx::layout::row_major);
+```
+
 Keep the public API as float* A, float* B, float* C. Do not use CUDA syntax or oneMKL.
 For A100 FP32 GEMM, prefer a TF32 Tensor Core plan when correctness can still pass rtol/atol around 1e-3.
 Use Nsight metric sm__inst_executed_pipe_tensor.avg.pct_of_peak_sustained_active as the main signal that Tensor Cores are actually used."""
