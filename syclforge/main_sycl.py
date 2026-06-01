@@ -263,6 +263,8 @@ def run_task(task: GemmTask, args: argparse.Namespace, batch_dir: Path) -> dict[
                 bench_result=bench_dict,
                 tensor_core_enabled=args.tensor_core_enabled,
                 tensor_core_report=args.tensor_core_report,
+                rtol=args.rtol,
+                atol=args.atol,
             )
             save_text(io_dir / f"round_{round_idx:03d}_repair_prompt.txt", prompt)
             raw = call_llm(prompt, system, call_type="repair", round_idx=round_idx)
@@ -282,6 +284,8 @@ def run_task(task: GemmTask, args: argparse.Namespace, batch_dir: Path) -> dict[
             ncu_metrics_block=profile_block,
             tensor_core_enabled=args.tensor_core_enabled,
             tensor_core_report=args.tensor_core_report,
+            rtol=args.rtol,
+            atol=args.atol,
         )
         save_text(io_dir / f"round_{round_idx:03d}_judge_prompt.txt", judge_prompt)
         judge_raw = call_llm(judge_prompt, judge_system, call_type="judge_optimization", round_idx=round_idx)
@@ -297,6 +301,8 @@ def run_task(task: GemmTask, args: argparse.Namespace, batch_dir: Path) -> dict[
             strategy=strategy,
             tensor_core_enabled=args.tensor_core_enabled,
             tensor_core_report=args.tensor_core_report,
+            rtol=args.rtol,
+            atol=args.atol,
         )
         save_text(io_dir / f"round_{round_idx:03d}_opt_prompt.txt", opt_prompt)
         opt_raw = call_llm(opt_prompt, opt_system, call_type="optimization", round_idx=round_idx)

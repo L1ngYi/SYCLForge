@@ -769,19 +769,18 @@ def benchmark_candidate(
                     raise RuntimeError(f"timed_gemm_entry returned invalid time: {elapsed}")
                 samples.append(elapsed)
 
-            np.testing.assert_allclose(c_mat.astype(np.float32), reference, rtol=rtol, atol=atol)
             time_ms = statistics.median(samples)
             gflops = task.flops / (time_ms * 1e6)
             result.runnable = True
-            result.correctness_pass = True
             result.time_samples_ms = samples
             result.time_ms = time_ms
             result.gflops = gflops
             result.peak_pct = gflops / peak_gflops * 100.0 if peak_gflops > 0 else None
+            np.testing.assert_allclose(c_mat.astype(np.float32), reference, rtol=rtol, atol=atol)
+            result.correctness_pass = True
             result.score = gflops
             return result
         except Exception as exc:
-            result.runnable = False
             result.correctness_pass = False
             result.error_type = exc.__class__.__name__
             result.message = str(exc)
