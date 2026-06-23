@@ -34,6 +34,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--first-n", type=int, default=0, help="Run the first N sorted GEMM cases.")
     parser.add_argument("--round", "-G", type=int, default=6, help="Total rounds including the seed evaluation.")
     parser.add_argument("--work-dir", type=Path, default=Path("syclforge_runs"), help="Output root directory.")
+    parser.add_argument(
+        "--resume-run",
+        type=Path,
+        default=None,
+        help="Continue an existing run directory and skip cases that already have a per-case summary.json.",
+    )
     parser.add_argument("--write-back-dir", type=Path, default=None, help="Optional directory to receive best gemm_*.cpp files.")
     parser.add_argument("--gpu", default="A100", help="GPU name used in prompts.")
     parser.add_argument("--backend", default="nvidia", choices=["nvidia", "generic"], help="SYCL backend preset.")
@@ -579,6 +585,19 @@ def save_batch_summary(batch_dir: Path, summaries: list[dict[str, Any]]) -> None
             )
 
 
+def _load_completed_summary(batch_dir: Path, task: GemmTask) -> dict[str, Any] | None:
+    summary_path = batch_dir / task.stem / "summary.json"
+    if not summary_path.is_file():
+        return None
+    try:
+        payload = json.loads(summary_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if payload.get("stem") != task.stem:
+        return None
+    return payload
+
+
 def configure_tensor_core_mode(args: argparse.Namespace, batch_dir: Path, tasks: list[GemmTask]) -> None:
     args.tensor_core_enabled = False
     args.tensor_core_report = {"requested": bool(args.tensor_core or args.require_tensor_core), "enabled": False}
@@ -615,15 +634,28 @@ def main() -> None:
     args = build_arg_parser().parse_args()
     started = time.time()
     tasks = discover_tasks(args.sycl_path.resolve(), case_stem=args.case_stem, first_n=args.first_n)
-    batch_dir = _make_batch_dir(args)
+    if args.resume_run is not None:
+        batch_dir = args.resume_run.resolve()
+        batch_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        batch_dir = _make_batch_dir(args)
     print(f"[SYCLForge] output: {batch_dir}", flush=True)
     print(f"[SYCLForge] tasks: {len(tasks)}", flush=True)
+    if args.resume_run is not None:
+        print("[SYCLForge] resume mode: completed cases with summary.json will be skipped.", flush=True)
     configure_tensor_core_mode(args, batch_dir, tasks)
 
     summaries = []
     for index, task in enumerate(tasks, 1):
         print(f"\n===== [{index}/{len(tasks)}] {task.stem} =====", flush=True)
+        completed = _load_completed_summary(batch_dir, task) if args.resume_run is not None else None
+        if completed is not None:
+            print(f"[{task.stem}] resume: found existing summary.json; skipping.", flush=True)
+            summaries.append(completed)
+            save_batch_summary(batch_dir, summaries)
+            continue
         summaries.append(run_task(task, args, batch_dir))
+        save_batch_summary(batch_dir, summaries)
 
     save_batch_summary(batch_dir, summaries)
     elapsed = time.time() - started

@@ -893,7 +893,13 @@ def benchmark_candidate_isolated(
         pass
     process.join()
 
-    payload = parent_conn.recv() if parent_conn.poll() else None
+    payload = None
+    recv_error = ""
+    try:
+        if parent_conn.poll():
+            payload = parent_conn.recv()
+    except (EOFError, OSError, ConnectionError) as exc:
+        recv_error = f"; recv_error={exc.__class__.__name__}: {exc}"
     try:
         parent_conn.close()
     except Exception:
@@ -910,7 +916,7 @@ def benchmark_candidate_isolated(
         runnable=False,
         correctness_pass=False,
         error_type="BenchmarkSubprocessCrashed",
-        message=f"benchmark subprocess exited without a result; exitcode={process.exitcode}",
+        message=f"benchmark subprocess exited without a result; exitcode={process.exitcode}{recv_error}",
     )
 
 

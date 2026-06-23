@@ -32,6 +32,15 @@ BASELINE_DETAIL=benchmark/baselines/gemm_detail_newprompt_ds.csv
 ROUNDS=8 MAX_TOKENS=20000 ./run_syclforge_full_gemm_suite.sh
 ```
 
+如果中途被坏 kernel、机器故障或连接中断打断，可以在同一个运行目录上续跑：
+
+```bash
+RESUME_RUN=syclforge_full_runs/<timestamp>_batch_deepseek-v4-pro \
+ROUNDS=5 ./run_syclforge_full_gemm_suite.sh
+```
+
+续跑会跳过已经写出 `<case>/summary.json` 的 case，并从第一个未完成 case 继续。当前粒度是 case 级断点；已经完成的 GEMM 不会再次调用 LLM，未完成或崩溃中的 GEMM 会重新跑该 case。
+
 如果只想先验证流程，不接 LLM，可以直接用：
 
 ```bash
