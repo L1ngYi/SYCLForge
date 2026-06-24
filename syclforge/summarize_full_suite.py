@@ -115,6 +115,8 @@ def _build_comparison_rows(
         old_sycl = _float_or_none(baseline.get("our_sycl_gflops"))
         dpcpp = _float_or_none(baseline.get("dpcpp_gflops"))
         tensor_route = tuned.get("tensor_core_route") or {}
+        primary_baseline = "OR-CUDA" if group == "A" else "DPCT"
+        primary_baseline_gflops = cuda if group == "A" else dpcpp
         output.append(
             {
                 "case_id": baseline.get("case_id", ""),
@@ -135,10 +137,14 @@ def _build_comparison_rows(
                 "old_our_sycl_retention_pct": _pct(old_sycl, cuda),
                 "dpcpp_retention_pct": _pct(dpcpp, cuda) if group != "A" else None,
                 "speedup_vs_dpcpp": _ratio(best, dpcpp) if group != "A" else None,
+                "primary_baseline": primary_baseline,
+                "primary_baseline_gflops": primary_baseline_gflops,
+                "speedup_vs_primary_baseline": _ratio(best, primary_baseline_gflops),
+                "retention_vs_primary_baseline_pct": _pct(best, primary_baseline_gflops),
                 "tensor_core_decision": tensor_route.get("decision", ""),
                 "best_round": tuned.get("best_round", ""),
                 "best_path": tuned.get("best_path", ""),
-                "has_syclforge_result": bool(tuned),
+                "has_syclforge_result": best is not None,
                 "cuda_status": baseline.get("cuda_status", ""),
                 "dpcpp_status": baseline.get("dpcpp_status", "") if group != "A" else "not_applicable",
             }
@@ -166,6 +172,10 @@ def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         "old_our_sycl_retention_pct",
         "dpcpp_retention_pct",
         "speedup_vs_dpcpp",
+        "primary_baseline",
+        "primary_baseline_gflops",
+        "speedup_vs_primary_baseline",
+        "retention_vs_primary_baseline_pct",
         "tensor_core_decision",
         "best_round",
         "best_path",
@@ -213,6 +223,35 @@ def _group_summary(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return output
 
 
+def _primary_group_summary(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    groups = [
+        ("Standard", "DPCT", [row for row in rows if row["group"] != "A"]),
+        ("Advanced", "OR-CUDA", [row for row in rows if row["group"] == "A"]),
+    ]
+    output = []
+    for group_name, baseline_name, group_rows in groups:
+        if not group_rows:
+            continue
+        output.append(
+            {
+                "suite_group": group_name,
+                "primary_baseline": baseline_name,
+                "cases": len(group_rows),
+                "syclforge_results": sum(1 for row in group_rows if row["has_syclforge_result"]),
+                "median_primary_baseline_gflops": _median([row["primary_baseline_gflops"] for row in group_rows]),
+                "median_syclforge_best_gflops": _median([row["syclforge_best_gflops"] for row in group_rows]),
+                "median_speedup_vs_primary_baseline": _median(
+                    [row["speedup_vs_primary_baseline"] for row in group_rows]
+                ),
+                "median_retention_vs_primary_baseline_pct": _median(
+                    [row["retention_vs_primary_baseline_pct"] for row in group_rows]
+                ),
+                "median_speedup_vs_seed": _median([row["speedup_vs_seed"] for row in group_rows]),
+            }
+        )
+    return output
+
+
 def _write_group_csv(path: Path, rows: list[dict[str, Any]]) -> None:
     columns = [
         "group",
@@ -233,6 +272,68 @@ def _write_group_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         writer.writeheader()
         for row in rows:
             writer.writerow({column: row.get(column, "") for column in columns})
+
+
+def _write_primary_group_csv(path: Path, rows: list[dict[str, Any]]) -> None:
+    columns = [
+        "suite_group",
+        "primary_baseline",
+        "cases",
+        "syclforge_results",
+        "median_primary_baseline_gflops",
+        "median_syclforge_best_gflops",
+        "median_speedup_vs_primary_baseline",
+        "median_retention_vs_primary_baseline_pct",
+        "median_speedup_vs_seed",
+    ]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=columns)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({column: row.get(column, "") for column in columns})
+
+
+def _write_primary_case_csv(path: Path, rows: list[dict[str, Any]]) -> None:
+    columns = [
+        "case_id",
+        "suite_group",
+        "shape",
+        "stem",
+        "primary_baseline",
+        "primary_baseline_gflops",
+        "syclforge_seed_gflops",
+        "syclforge_best_gflops",
+        "speedup_vs_seed",
+        "speedup_vs_primary_baseline",
+        "retention_vs_primary_baseline_pct",
+        "tensor_core_decision",
+        "best_round",
+        "best_path",
+    ]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=columns)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(
+                {
+                    "case_id": row["case_id"],
+                    "suite_group": "Advanced" if row["group"] == "A" else "Standard",
+                    "shape": f"{row['m']}x{row['k']}x{row['n']}",
+                    "stem": row["stem"],
+                    "primary_baseline": row["primary_baseline"],
+                    "primary_baseline_gflops": row["primary_baseline_gflops"],
+                    "syclforge_seed_gflops": row["syclforge_seed_gflops"],
+                    "syclforge_best_gflops": row["syclforge_best_gflops"],
+                    "speedup_vs_seed": row["speedup_vs_seed"],
+                    "speedup_vs_primary_baseline": row["speedup_vs_primary_baseline"],
+                    "retention_vs_primary_baseline_pct": row["retention_vs_primary_baseline_pct"],
+                    "tensor_core_decision": row["tensor_core_decision"],
+                    "best_round": row["best_round"],
+                    "best_path": row["best_path"],
+                }
+            )
 
 
 def _write_markdown(path: Path, rows: list[dict[str, Any]], group_rows: list[dict[str, Any]], *, baseline_path: Path, run_dir: Path) -> None:
@@ -293,6 +394,66 @@ def _write_markdown(path: Path, rows: list[dict[str, Any]], group_rows: list[dic
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def _write_primary_markdown(
+    path: Path,
+    rows: list[dict[str, Any]],
+    primary_group_rows: list[dict[str, Any]],
+    *,
+    baseline_path: Path,
+    run_dir: Path,
+) -> None:
+    lines = [
+        "# SYCLForge Primary Baseline Comparison",
+        "",
+        f"- SYCLForge run: `{run_dir}`",
+        f"- Baseline detail: `{baseline_path}`",
+        "- Primary comparison: Standard GEMM vs DPCT; Advanced GEMM vs OR-CUDA.",
+        "",
+        "## Primary Group Summary",
+        "",
+        "| Suite Group | Primary Baseline | Cases | SYCLForge Results | Median Baseline GFLOPS | Median SYCLForge GFLOPS | Median Speedup vs Baseline | Median Retention vs Baseline |",
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    for row in primary_group_rows:
+        lines.append(
+            "| {suite_group} | {baseline} | {cases} | {results} | {baseline_gflops} | {best} | {speedup} | {retention} |".format(
+                suite_group=row["suite_group"],
+                baseline=row["primary_baseline"],
+                cases=row["cases"],
+                results=row["syclforge_results"],
+                baseline_gflops=_fmt(row["median_primary_baseline_gflops"]),
+                best=_fmt(row["median_syclforge_best_gflops"]),
+                speedup=_fmt(row["median_speedup_vs_primary_baseline"], 4),
+                retention=_fmt(row["median_retention_vs_primary_baseline_pct"], 2),
+            )
+        )
+    lines.extend(
+        [
+            "",
+            "## Primary Case Detail",
+            "",
+            "| Case | Suite Group | Shape | Primary Baseline | Baseline GFLOPS | SYCLForge Best | Speedup vs Baseline | Retention vs Baseline | Tensor Route |",
+            "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | --- |",
+        ]
+    )
+    for row in rows:
+        lines.append(
+            "| {case} | {suite_group} | {shape} | {baseline} | {baseline_gflops} | {best} | {speedup} | {retention} | {route} |".format(
+                case=row["case_id"],
+                suite_group="Advanced" if row["group"] == "A" else "Standard",
+                shape=f"{row['m']}x{row['k']}x{row['n']}",
+                baseline=row["primary_baseline"],
+                baseline_gflops=_fmt(row["primary_baseline_gflops"]),
+                best=_fmt(row["syclforge_best_gflops"]),
+                speedup=_fmt(row["speedup_vs_primary_baseline"], 4),
+                retention=_fmt(row["retention_vs_primary_baseline_pct"], 2),
+                route=row["tensor_core_decision"],
+            )
+        )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser("Summarize a full SYCLForge GEMM suite against old OR-CUDA/DPCT baselines.")
     parser.add_argument("run_dir", type=Path, help="A syclforge run directory containing summary.json or summary.csv.")
@@ -321,14 +482,27 @@ def main(argv: list[str] | None = None) -> None:
     syclforge_rows = _load_syclforge_summary(run_dir)
     rows = _build_comparison_rows(syclforge_rows=syclforge_rows, baseline_rows=baseline_rows)
     group_rows = _group_summary(rows)
+    primary_group_rows = _primary_group_summary(rows)
 
     _write_csv(out_dir / "suite_case_comparison.csv", rows)
     _write_group_csv(out_dir / "suite_group_summary.csv", group_rows)
     _write_markdown(out_dir / "suite_comparison.md", rows, group_rows, baseline_path=baseline_detail, run_dir=run_dir)
+    _write_primary_case_csv(out_dir / "suite_primary_case_comparison.csv", rows)
+    _write_primary_group_csv(out_dir / "suite_primary_group_summary.csv", primary_group_rows)
+    _write_primary_markdown(
+        out_dir / "suite_primary_comparison.md",
+        rows,
+        primary_group_rows,
+        baseline_path=baseline_detail,
+        run_dir=run_dir,
+    )
 
     print(f"[SYCLForge] case comparison: {out_dir / 'suite_case_comparison.csv'}")
     print(f"[SYCLForge] group summary: {out_dir / 'suite_group_summary.csv'}")
     print(f"[SYCLForge] markdown: {out_dir / 'suite_comparison.md'}")
+    print(f"[SYCLForge] primary case comparison: {out_dir / 'suite_primary_case_comparison.csv'}")
+    print(f"[SYCLForge] primary group summary: {out_dir / 'suite_primary_group_summary.csv'}")
+    print(f"[SYCLForge] primary markdown: {out_dir / 'suite_primary_comparison.md'}")
 
 
 if __name__ == "__main__":
