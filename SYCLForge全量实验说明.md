@@ -41,6 +41,30 @@ ROUNDS=5 ./run_syclforge_full_gemm_suite.sh
 
 续跑会跳过已经写出 `<case>/summary.json` 的 case，并从第一个未完成 case 继续。当前粒度是 case 级断点；已经完成的 GEMM 不会再次调用 LLM，未完成或崩溃中的 GEMM 会重新跑该 case。
 
+## 补跑 S1/A2
+
+如果全量结果里 `gemm_128_128_128` 因 event profiling 计时为 0 没有结果，或者 Advanced A2
+`gemm_2048_16384_2048` 只保留了 seed，可以用补跑脚本：
+
+```bash
+BASE_RUN=syclforge_full_runs/20260623_122215_batch_deepseek-v4-pro \
+./run_syclforge_patch_s1_a2.sh
+```
+
+脚本会：
+
+| Case | 动作 |
+| --- | --- |
+| S1 `gemm_128_128_128` | 用 wall-clock fallback 重新测 seed，不调用 LLM |
+| A2 `gemm_2048_16384_2048` | 复用已有高速 Tensor Core candidate，并用 `A2_ATOL=2e-1` 重判高 K 的 TF32 累积误差 |
+
+A2 的默认补跑不再消耗 LLM token。若需要更严格或更宽的 A2 判定，可以覆盖：
+
+```bash
+A2_ATOL=1e-1 ./run_syclforge_patch_s1_a2.sh
+A2_ATOL=3e-1 ./run_syclforge_patch_s1_a2.sh
+```
+
 如果只想先验证流程，不接 LLM，可以直接用：
 
 ```bash

@@ -40,6 +40,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Continue an existing run directory and skip cases that already have a per-case summary.json.",
     )
+    parser.add_argument(
+        "--rerun-completed",
+        action="store_true",
+        help="In resume mode, rerun the selected tasks even if they already have a valid summary. Extra rounds are appended.",
+    )
     parser.add_argument("--write-back-dir", type=Path, default=None, help="Optional directory to receive best gemm_*.cpp files.")
     parser.add_argument("--gpu", default="A100", help="GPU name used in prompts.")
     parser.add_argument("--backend", default="nvidia", choices=["nvidia", "generic"], help="SYCL backend preset.")
@@ -138,6 +143,19 @@ def _safe_json_from_reply(raw: str) -> Any:
 
 def _round_code_path(task_dir: Path, round_idx: int, phase: str) -> Path:
     return task_dir / "code" / f"round_{round_idx:03d}_{phase}.cpp"
+
+
+def _load_case_summary(task_dir: Path, stem: str) -> dict[str, Any] | None:
+    summary_path = task_dir / "summary.json"
+    if not summary_path.is_file():
+        return None
+    try:
+        payload = json.loads(summary_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if payload.get("stem") != stem:
+        return None
+    return payload
 
 
 def _save_round_artifacts(
@@ -305,6 +323,8 @@ def run_task(task: GemmTask, args: argparse.Namespace, batch_dir: Path) -> dict[
     task_dir.mkdir(parents=True, exist_ok=True)
     usage_log = task_dir / "usage.csv"
     call_llm = None if args.no_llm else _make_llm_caller(args, usage_log)
+    append_existing = bool(args.resume_run is not None and args.rerun_completed)
+    existing_summary = _load_case_summary(task_dir, task.stem) if append_existing else None
 
     route = getattr(args, "tensor_core_routes", {}).get(task.stem, {"enabled": False, "decision": "off"})
     task_tensor_core_enabled = bool(getattr(args, "tensor_core_enabled", False) and route.get("enabled"))
@@ -322,10 +342,30 @@ def run_task(task: GemmTask, args: argparse.Namespace, batch_dir: Path) -> dict[
     best_tensor_score = float("-inf")
     seed_gflops: float | None = None
     rounds: list[dict[str, Any]] = []
+    start_round = 0
+    if existing_summary:
+        seed_gflops = existing_summary.get("seed_gflops")
+        best_round = int(existing_summary.get("best_round") or -1)
+        best_gflops = existing_summary.get("best_gflops")
+        if isinstance(best_gflops, (int, float)):
+            best_score = float(best_gflops)
+        rounds = list(existing_summary.get("rounds") or [])
+        start_round = max([int(item.get("round", -1)) for item in rounds] + [-1]) + 1
+        existing_best = task_dir / "best.cpp"
+        if existing_best.is_file():
+            best_code = existing_best.read_text(encoding="utf-8", errors="ignore")
+            best_simt_code = best_code
+            best_simt_score = best_score
+        print(f"[{task.stem}] resume rerun: appending from round {start_round}", flush=True)
     pending: list[dict[str, Any]] = [
-        _make_candidate_item(seed_code, phase="seed", lane="seed", tensor_core_enabled=False)
+        _make_candidate_item(
+            seed_code,
+            phase="seed" if start_round == 0 else "patch_seed",
+            lane="seed" if start_round == 0 else ("patch_tensor" if task_tensor_core_enabled else "patch_seed"),
+            tensor_core_enabled=bool(start_round > 0 and task_tensor_core_enabled),
+        )
     ]
-    max_rounds = max(1, args.round)
+    end_round = start_round + max(1, args.round)
 
     route_path = save_text(task_dir / "tensor_core_route.json", json.dumps(route, indent=2, ensure_ascii=False))
     print(
@@ -341,8 +381,8 @@ def run_task(task: GemmTask, args: argparse.Namespace, batch_dir: Path) -> dict[
         print(f"[{task.stem}] LLM mode: using isolated benchmark for native crash containment", flush=True)
     benchmark_fn = benchmark_candidate_isolated if use_isolated_benchmark else benchmark_candidate
 
-    round_idx = 0
-    while round_idx < max_rounds and pending:
+    round_idx = start_round
+    while round_idx < end_round and pending:
         item = pending.pop(0)
         current_code = item["code"]
         phase = item["phase"]
@@ -414,14 +454,14 @@ def run_task(task: GemmTask, args: argparse.Namespace, batch_dir: Path) -> dict[
             }
         )
 
-        if args.no_llm or round_idx >= max_rounds - 1:
+        if args.no_llm or round_idx >= end_round - 1:
             round_idx += 1
             break
         assert call_llm is not None
 
         io_dir = task_dir / "llm_io"
         io_dir.mkdir(parents=True, exist_ok=True)
-        remaining_slots = max_rounds - round_idx - 1
+        remaining_slots = end_round - round_idx - 1
 
         if not bench.correctness_pass:
             if pending:
@@ -588,18 +628,44 @@ def save_batch_summary(batch_dir: Path, summaries: list[dict[str, Any]]) -> None
 
 
 def _load_completed_summary(batch_dir: Path, task: GemmTask) -> dict[str, Any] | None:
-    summary_path = batch_dir / task.stem / "summary.json"
-    if not summary_path.is_file():
-        return None
-    try:
-        payload = json.loads(summary_path.read_text(encoding="utf-8"))
-    except Exception:
-        return None
-    if payload.get("stem") != task.stem:
+    payload = _load_case_summary(batch_dir / task.stem, task.stem)
+    if payload is None:
         return None
     if payload.get("best_gflops") is None or not payload.get("best_path"):
         return None
     return payload
+
+
+def _load_existing_batch_summaries(batch_dir: Path) -> tuple[list[str], dict[str, dict[str, Any]]]:
+    order: list[str] = []
+    summaries: dict[str, dict[str, Any]] = {}
+    batch_summary = batch_dir / "summary.json"
+    if batch_summary.is_file():
+        try:
+            payload = json.loads(batch_summary.read_text(encoding="utf-8"))
+        except Exception:
+            payload = {}
+        for item in payload.get("tasks", []):
+            stem = item.get("stem")
+            if not stem:
+                continue
+            order.append(stem)
+            summaries[stem] = item
+
+    for summary_path in sorted(batch_dir.glob("gemm_*/summary.json")):
+        stem = summary_path.parent.name
+        if stem in summaries:
+            continue
+        item = _load_case_summary(summary_path.parent, stem)
+        if item is None:
+            continue
+        order.append(stem)
+        summaries[stem] = item
+    return order, summaries
+
+
+def _ordered_summaries(order: list[str], summaries: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    return [summaries[stem] for stem in order if stem in summaries]
 
 
 def configure_tensor_core_mode(args: argparse.Namespace, batch_dir: Path, tasks: list[GemmTask]) -> None:
@@ -649,19 +715,26 @@ def main() -> None:
         print("[SYCLForge] resume mode: completed cases with summary.json will be skipped.", flush=True)
     configure_tensor_core_mode(args, batch_dir, tasks)
 
-    summaries = []
+    if args.resume_run is not None:
+        summary_order, summary_by_stem = _load_existing_batch_summaries(batch_dir)
+    else:
+        summary_order, summary_by_stem = [], {}
     for index, task in enumerate(tasks, 1):
         print(f"\n===== [{index}/{len(tasks)}] {task.stem} =====", flush=True)
-        completed = _load_completed_summary(batch_dir, task) if args.resume_run is not None else None
+        completed = None if args.rerun_completed else (_load_completed_summary(batch_dir, task) if args.resume_run is not None else None)
         if completed is not None:
             print(f"[{task.stem}] resume: found existing summary.json; skipping.", flush=True)
-            summaries.append(completed)
-            save_batch_summary(batch_dir, summaries)
+            summary_by_stem[task.stem] = completed
+            if task.stem not in summary_order:
+                summary_order.append(task.stem)
+            save_batch_summary(batch_dir, _ordered_summaries(summary_order, summary_by_stem))
             continue
-        summaries.append(run_task(task, args, batch_dir))
-        save_batch_summary(batch_dir, summaries)
+        summary_by_stem[task.stem] = run_task(task, args, batch_dir)
+        if task.stem not in summary_order:
+            summary_order.append(task.stem)
+        save_batch_summary(batch_dir, _ordered_summaries(summary_order, summary_by_stem))
 
-    save_batch_summary(batch_dir, summaries)
+    save_batch_summary(batch_dir, _ordered_summaries(summary_order, summary_by_stem))
     elapsed = time.time() - started
     print(f"[SYCLForge] done in {elapsed:.1f}s", flush=True)
     print(f"[SYCLForge] summary: {batch_dir / 'summary.csv'}", flush=True)
