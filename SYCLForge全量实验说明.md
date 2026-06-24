@@ -77,6 +77,8 @@ benchmark/baselines/gemm_detail_newprompt_ds.csv
 
 汇总脚本会按 `gemm_M_K_N` 对齐：
 
+全量脚本会显式开启 `--isolated-benchmark`。LLM 生成的候选 kernel 如果触发 CUDA illegal address 或 SYCL runtime assertion，会被记为本轮失败候选，而不是中断整批实验。
+
 | 组别 | 比较对象 |
 | --- | --- |
 | Standard S/K/N/M 共 20 个 | OR-CUDA、旧 Our-SYCL、DPCT、SYCLForge tuned |

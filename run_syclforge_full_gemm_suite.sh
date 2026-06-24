@@ -41,6 +41,7 @@ MAIN_ARGS=(
   --model_name "$MODEL_NAME"
   --max_tokens "$MAX_TOKENS"
   --tensor-core
+  --isolated-benchmark
   --rtol "$RTOL"
   --atol "$ATOL"
   --work-dir "$WORK_DIR"

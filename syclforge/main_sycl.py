@@ -76,7 +76,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--isolated-benchmark",
         action="store_true",
-        help="Run benchmarking in a subprocess. Useful for GPUs in Exclusive_Process compute mode.",
+        help="Force benchmarking in a subprocess. LLM optimization and Tensor Core routes enable this automatically.",
     )
     parser.add_argument("--no-llm", action="store_true", help="Only evaluate the existing seed kernels.")
     parser.add_argument("--server_type", default="local", help="CudaForge query_server provider.")
@@ -334,9 +334,11 @@ def run_task(task: GemmTask, args: argparse.Namespace, batch_dir: Path) -> dict[
         flush=True,
     )
 
-    use_isolated_benchmark = bool(args.isolated_benchmark or task_tensor_core_enabled)
+    use_isolated_benchmark = bool(args.isolated_benchmark or task_tensor_core_enabled or not args.no_llm)
     if task_tensor_core_enabled and not args.isolated_benchmark:
         print(f"[{task.stem}] tensor-core mode: using isolated benchmark for native crash containment", flush=True)
+    elif use_isolated_benchmark and not args.isolated_benchmark:
+        print(f"[{task.stem}] LLM mode: using isolated benchmark for native crash containment", flush=True)
     benchmark_fn = benchmark_candidate_isolated if use_isolated_benchmark else benchmark_candidate
 
     round_idx = 0
