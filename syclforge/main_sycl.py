@@ -597,6 +597,8 @@ def _load_completed_summary(batch_dir: Path, task: GemmTask) -> dict[str, Any] |
         return None
     if payload.get("stem") != task.stem:
         return None
+    if payload.get("best_gflops") is None or not payload.get("best_path"):
+        return None
     return payload
 
 

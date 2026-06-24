@@ -626,6 +626,7 @@ def build_benchmark_source(
 
     return f"""
 #include <cstdint>
+#include <chrono>
 #include <exception>
 #include <iostream>
 #include <sycl/sycl.hpp>
@@ -645,6 +646,7 @@ extern "C" float timed_gemm_entry({extern_c_params}) {{
     }}
 
     std::uint64_t total_ns = 0;
+    auto wall_start = std::chrono::high_resolution_clock::now();
     for (int i = 0; i < {iters}; ++i) {{
       sycl::event event = {metadata["kernel_name"]}({invocation_args});
       event.wait();
@@ -652,10 +654,13 @@ extern "C" float timed_gemm_entry({extern_c_params}) {{
           event.get_profiling_info<sycl::info::event_profiling::command_end>() -
           event.get_profiling_info<sycl::info::event_profiling::command_start>());
     }}
+    auto wall_end = std::chrono::high_resolution_clock::now();
+    double event_ms = total_ns / 1.0e6 / {iters};
+    double wall_ms = std::chrono::duration<double, std::milli>(wall_end - wall_start).count() / {iters};
 
     q.memcpy({output_param["name"]}, {output_device}, {output_size} * sizeof({output_param["storage_dtype"]})).wait();
     {" ".join(free_lines)}
-    return static_cast<float>(total_ns / 1.0e6 / {iters});
+    return static_cast<float>(event_ms > 0.0 ? event_ms : wall_ms);
   }} catch (const sycl::exception &e) {{
     std::cerr << "[SYCL Harness Error] " << e.what() << std::endl;
     return {FAILURE_MS:.1f}f;
